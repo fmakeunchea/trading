@@ -659,6 +659,24 @@ class AlpacaBroker:
         )
 
     # ------------------------------------------------------------------ #
+    # Diagnostics (for the opt-in paper smoke test only)
+    # ------------------------------------------------------------------ #
+
+    def diagnose_order_by_coid(self, client_order_id: str) -> dict:
+        """Fetch a raw SDK order by COID and return its full field dump.
+
+        Bypasses our typed DTO translation. Used by
+        ``scripts/paper_smoke.py`` to expose exactly what alpaca-py
+        returned when a wrapper-level assumption appears to be wrong.
+        Not used by the orchestrator.
+        """
+        def call() -> Any:
+            return self._client.get_order_by_client_id(client_order_id)
+
+        raw = _with_retry(call, self._retry, sleep=self._sleep)
+        return _order_attrs_for_diagnostics(raw)
+
+    # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
 
@@ -831,6 +849,71 @@ def _extract_latest_trade(raw: Any, symbol: str) -> Trade:
         price=Decimal(str(t.price)),
         size=int(t.size or 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (used by scripts/paper_smoke.py to inspect raw SDK shapes)
+# ---------------------------------------------------------------------------
+
+
+def _order_attrs_for_diagnostics(raw: Any) -> Any:
+    """Return a JSON-serialisable view of an SDK Order.
+
+    The preferred path is pydantic's ``model_dump(mode="json")`` because
+    alpaca-py's Order model is a pydantic BaseModel; that returns the
+    full field set without us having to guess field names. The fallback
+    hand-walks a superset of the fields we care about so we still get
+    useful output against a non-pydantic mock.
+
+    This helper is intentionally live-only — it exists so the smoke
+    script can tell the operator *exactly* what shape alpaca-py
+    returned for a parent order and its legs, without requiring changes
+    to the DTO mapping. It is not used by the orchestrator.
+    """
+    if raw is None:
+        return None
+    # pydantic v2
+    fn = getattr(raw, "model_dump", None)
+    if callable(fn):
+        try:
+            return fn(mode="json")
+        except Exception:  # noqa: BLE001 — fall through to manual walk
+            pass
+    # pydantic v1
+    fn = getattr(raw, "dict", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            pass
+    out: dict[str, Any] = {}
+    for key in (
+        "id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "qty",
+        "filled_qty",
+        "status",
+        "order_class",
+        "order_type",
+        "type",
+        "parent_id",
+        "parent_client_order_id",
+        "stop_price",
+        "limit_price",
+        "filled_avg_price",
+        "submitted_at",
+        "filled_at",
+    ):
+        val = getattr(raw, key, None)
+        out[key] = str(val) if val is not None else None
+    legs = getattr(raw, "legs", None)
+    if legs:
+        out["legs"] = [_order_attrs_for_diagnostics(leg) for leg in legs]
+    else:
+        out["legs"] = None
+    return out
 
 
 def _synthetic_noop_order(symbol: str, client_order_id: str) -> BrokerOrder:

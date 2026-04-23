@@ -57,6 +57,7 @@ defence in depth, not a replacement for checking your credentials.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -269,7 +270,13 @@ def stage_oto_submission(
     symbol: str,
     qty: int,
 ) -> tuple[OrderIntent, str] | None:
-    """Submit an OTO entry and verify parent+child appear on the broker."""
+    """Submit an OTO entry, always print the raw parent+legs dump, and
+    verify that we can reliably link a leg back to its parent.
+
+    The raw dump is the authoritative record of what alpaca-py returned
+    and is what the operator needs when a wrapper-level assumption
+    appears wrong (e.g. ``parent_client_order_id`` not populating).
+    """
     try:
         intent, mid = _build_intent(broker, symbol, qty, suffix="oto")
         submitted = broker.submit_entry_with_protection(intent)
@@ -277,21 +284,105 @@ def stage_oto_submission(
         report.add("oto_submission", False, f"submit failed: {exc}")
         return None
 
-    details = (
-        f"parent coid={submitted.parent.client_order_id} "
-        f"child coid={submitted.stop_child.client_order_id if submitted.stop_child else 'MISSING'}"
+    # --- Always fetch and print the raw SDK view ---------------------
+    # If this call itself fails, we still fail the stage but include as
+    # much as we have.
+    try:
+        raw_dump = broker.diagnose_order_by_coid(intent.client_order_id())
+    except StrategyError as exc:
+        raw_dump = {"diagnostic_fetch_error": str(exc)}
+
+    print("  [diagnostic] submitted intent:")
+    print(
+        json.dumps(
+            {
+                "intent_id": intent.intent_id,
+                "client_order_id": intent.client_order_id(),
+                "symbol": intent.symbol,
+                "qty": intent.qty,
+                "limit_price": str(intent.limit_price),
+                "disaster_stop_price": str(intent.disaster_stop_price),
+                "tif": intent.tif.value,
+                "order_class": intent.order_class.value,
+            },
+            indent=2,
+        )
     )
+    print("  [diagnostic] raw parent + legs as returned by alpaca-py "
+          "(via get_order_by_client_id):")
+    print(json.dumps(raw_dump, indent=2, default=str))
+    print("  [diagnostic] DTO-mapped SubmittedOrder:")
+    print(
+        json.dumps(
+            {
+                "parent": {
+                    "broker_order_id": submitted.parent.broker_order_id,
+                    "client_order_id": submitted.parent.client_order_id,
+                    "order_class": submitted.parent.order_class.value,
+                    "status": submitted.parent.status.value,
+                    "qty": submitted.parent.qty,
+                    "filled_qty": submitted.parent.filled_qty,
+                    "leg_role": submitted.parent.leg_role,
+                    "parent_client_order_id": submitted.parent.parent_client_order_id,
+                },
+                "stop_child": None if submitted.stop_child is None else {
+                    "broker_order_id": submitted.stop_child.broker_order_id,
+                    "client_order_id": submitted.stop_child.client_order_id,
+                    "order_class": submitted.stop_child.order_class.value,
+                    "status": submitted.stop_child.status.value,
+                    "qty": submitted.stop_child.qty,
+                    "filled_qty": submitted.stop_child.filled_qty,
+                    "leg_role": submitted.stop_child.leg_role,
+                    "parent_client_order_id": submitted.stop_child.parent_client_order_id,
+                },
+            },
+            indent=2,
+        )
+    )
+
+    # --- Check: the child must be *reliably linkable* to the parent.
+    # We try parent_client_order_id first (what the DTO name promises)
+    # and fall back to the raw-dump's ``parent_id`` field so the smoke
+    # report reflects which linkage actually works.
     if submitted.stop_child is None:
-        report.add("oto_submission", False, f"{details} — no stop child returned")
+        report.add("oto_submission", False, "no stop child returned")
         return None
-    if submitted.stop_child.parent_client_order_id != intent.client_order_id():
+
+    parent_coid = intent.client_order_id()
+    parent_raw_id = str(raw_dump.get("id", "")) if isinstance(raw_dump, dict) else ""
+    legs = raw_dump.get("legs") if isinstance(raw_dump, dict) else None
+    child_raw: dict = {}
+    if legs:
+        child_raw = next(
+            (leg for leg in legs if str(leg.get("order_type", leg.get("type", ""))).lower().find("stop") >= 0),
+            legs[0] if legs else {},
+        )
+    child_raw_parent_id = str(child_raw.get("parent_id") or "")
+    child_raw_parent_coid = str(child_raw.get("parent_client_order_id") or "")
+
+    linkage_by_coid = submitted.stop_child.parent_client_order_id == parent_coid
+    linkage_by_raw_parent_id = bool(parent_raw_id) and child_raw_parent_id == parent_raw_id
+
+    details = (
+        f"parent.coid={parent_coid} parent.id={parent_raw_id or '?'} "
+        f"child.coid={submitted.stop_child.client_order_id} "
+        f"child.parent_id={child_raw_parent_id or '?'} "
+        f"child.parent_client_order_id={child_raw_parent_coid or '?'}"
+    )
+    if linkage_by_coid:
+        report.add("oto_submission", True, f"linked via parent_client_order_id — {details}")
+    elif linkage_by_raw_parent_id:
         report.add(
             "oto_submission",
             False,
-            f"{details} — child parent_client_order_id does not match parent coid",
+            f"linked via raw parent_id only (DTO mapping needs update) — {details}",
         )
-        return None
-    report.add("oto_submission", True, details)
+    else:
+        report.add(
+            "oto_submission",
+            False,
+            f"no reliable parent linkage detected — {details}",
+        )
     return intent, submitted.stop_child.client_order_id
 
 

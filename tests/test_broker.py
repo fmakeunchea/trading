@@ -850,6 +850,94 @@ def test_feed_mapping_rejects_bogus() -> None:
         _to_sdk_feed("nasdaq_only")
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics helper used by scripts/paper_smoke.py
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_uses_model_dump_when_available() -> None:
+    """pydantic-like objects: return their model_dump verbatim."""
+    from strategy.broker import _order_attrs_for_diagnostics
+
+    class _FakePydantic:
+        def model_dump(self, mode: str = "python") -> dict:
+            return {"id": "parent-uuid", "client_order_id": "TBv1-xyz",
+                    "legs": [{"id": "child-uuid"}]}
+
+    out = _order_attrs_for_diagnostics(_FakePydantic())
+    assert out["id"] == "parent-uuid"
+    assert out["client_order_id"] == "TBv1-xyz"
+    assert out["legs"][0]["id"] == "child-uuid"
+
+
+def test_diagnose_falls_back_to_dict_v1() -> None:
+    """pydantic v1 exposes ``.dict()`` instead of model_dump — support it."""
+    from strategy.broker import _order_attrs_for_diagnostics
+
+    class _FakeV1:
+        def dict(self) -> dict:
+            return {"id": "p", "client_order_id": "TBv1-abc"}
+
+    out = _order_attrs_for_diagnostics(_FakeV1())
+    assert out["client_order_id"] == "TBv1-abc"
+
+
+def test_diagnose_walks_attrs_on_plain_object() -> None:
+    """Plain SimpleNamespace (or mock): fall back to getattr on a known list."""
+    from strategy.broker import _order_attrs_for_diagnostics
+
+    parent = SimpleNamespace(
+        id="p-id",
+        client_order_id="TBv1-parent",
+        symbol="AAPL",
+        qty="10",
+        status="new",
+        order_class="oto",
+        order_type="limit",
+        legs=[
+            SimpleNamespace(
+                id="c-id",
+                client_order_id="alpaca-generated-uuid",
+                symbol="AAPL",
+                qty="10",
+                status="held",
+                order_class="simple",
+                order_type="stop",
+                parent_id="p-id",
+                parent_client_order_id=None,
+                legs=None,
+            )
+        ],
+    )
+    out = _order_attrs_for_diagnostics(parent)
+    assert out["client_order_id"] == "TBv1-parent"
+    assert out["legs"][0]["parent_id"] == "p-id"
+    assert out["legs"][0]["order_type"] == "stop"
+
+
+def test_diagnose_none_input() -> None:
+    from strategy.broker import _order_attrs_for_diagnostics
+    assert _order_attrs_for_diagnostics(None) is None
+
+
+def test_diagnose_order_by_coid_calls_sdk_and_returns_dict() -> None:
+    b, client, _ = _broker()
+    fake = SimpleNamespace(
+        id="p-id",
+        client_order_id="TBv1-xyz",
+        symbol="AAPL",
+        qty="10",
+        status="new",
+        order_class="oto",
+        order_type="limit",
+        legs=[],
+    )
+    client.get_order_by_client_id.return_value = fake
+    out = b.diagnose_order_by_coid("TBv1-xyz")
+    assert out["client_order_id"] == "TBv1-xyz"
+    assert out["id"] == "p-id"
+
+
 def test_alpaca_imports_only_in_broker() -> None:
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent / "strategy"
