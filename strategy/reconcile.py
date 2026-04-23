@@ -88,7 +88,14 @@ def reconcile(
     for order in open_orders:
         if order.status not in PROTECTIVE_STATUSES:
             continue
-        if not order.client_order_id.startswith(coid_prefix):
+        # Ownership rule (paper-smoke verified 2026-04-23):
+        # Alpaca auto-generates UUID client_order_ids for OTO children,
+        # so we cannot identify ownership from the child's own COID.
+        # The **owning COID** is the parent's ``client_order_id`` for
+        # legs and the order's own ``client_order_id`` for top-level
+        # orders. Ours iff the owning COID starts with our prefix.
+        owning_coid = order.parent_client_order_id or order.client_order_id
+        if not owning_coid or not owning_coid.startswith(coid_prefix):
             report.broker_order_with_unknown_coid.append(order.broker_order_id)
             continue
         if order.leg_role == "stop_child" or order.parent_client_order_id is not None:

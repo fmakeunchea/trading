@@ -178,6 +178,106 @@ def test_partial_fill_with_orphan_child_detected() -> None:
     assert "AAPL" in report.partial_fill_with_orphan_child
 
 
+def test_real_alpaca_child_uuid_coid_is_still_ours() -> None:
+    """Regression: the 2026-04-23 paper smoke confirmed that Alpaca
+    auto-generates a UUID ``client_order_id`` on OTO children. The
+    ownership rule must therefore key on the *parent's* COID (carried
+    on the leg via traversal), not the child's own COID."""
+    state = StrategyState()
+    # Local state points at the real Alpaca-generated child COID.
+    alpaca_child_coid = "ebbe5352-cf19-4a57-8eaf-f9773c910b91"
+    state.open_trades["AAPL"] = _open_trade(
+        "AAPL", qty=10, child_coid=alpaca_child_coid,
+    )
+    # Broker returns the same UUID on the child, with our TBv1- parent
+    # COID on `parent_client_order_id` (populated by the wrapper during
+    # traversal, not by the SDK).
+    child = _protective_child(
+        "AAPL",
+        qty=10,
+        coid=alpaca_child_coid,
+        broker_id="b-child",
+        parent_coid=f"{COID_PREFIX}parent-AAPL",
+    )
+    report = reconcile(
+        state,
+        broker_positions=[_pos("AAPL", qty=10)],
+        broker_open_orders=[child],
+    )
+    assert report.is_clean() is True
+    # Crucially, the child is NOT flagged as unknown_coid even though
+    # its own COID is a non-TBv1 UUID.
+    assert child.broker_order_id not in report.broker_order_with_unknown_coid
+
+
+def test_foreign_leg_with_non_prefixed_parent_is_unknown_coid() -> None:
+    """A resting OTO stop from some other system: its parent COID does
+    not start with ``TBv1-``, so the leg is flagged as unknown_coid and
+    NOT added to protective_by_symbol (which would otherwise misfire
+    orphan detection)."""
+    state = StrategyState()
+    foreign_child = _protective_child(
+        "NVDA",
+        qty=3,
+        coid="alien-abc",                  # foreign child's own COID
+        broker_id="alien-child",
+        parent_coid="OTHER-alien-parent",  # foreign parent COID
+    )
+    report = reconcile(
+        state,
+        broker_positions=[],
+        broker_open_orders=[foreign_child],
+    )
+    assert "alien-child" in report.broker_order_with_unknown_coid
+    # Critically: NOT in orphan_protective_orders, because we refused
+    # to treat it as "ours" in the first place.
+    assert report.orphan_protective_orders == []
+
+
+def test_top_level_order_ownership_keyed_on_own_coid() -> None:
+    """For top-level orders (no parent), ownership is still decided by
+    the order's own ``client_order_id``. This test pins down the
+    fallback branch of the owning-COID rule."""
+    state = StrategyState()
+    ours = BrokerOrder(
+        broker_order_id="ours-1",
+        client_order_id=f"{COID_PREFIX}top-level",
+        symbol="NVDA",
+        side=OrderSide.BUY,
+        qty=3,
+        filled_qty=0,
+        avg_fill_price=None,
+        status=OrderStatus.NEW,
+        order_class=OrderClass.SIMPLE,
+        submitted_at=datetime(2026, 4, 23, 14, 0, tzinfo=UTC),
+        filled_at=None,
+        parent_client_order_id=None,    # top-level
+        leg_role=None,
+    )
+    foreign = BrokerOrder(
+        broker_order_id="foreign-1",
+        client_order_id="SOMEBODY-ELSES",
+        symbol="NVDA",
+        side=OrderSide.BUY,
+        qty=3,
+        filled_qty=0,
+        avg_fill_price=None,
+        status=OrderStatus.NEW,
+        order_class=OrderClass.SIMPLE,
+        submitted_at=datetime(2026, 4, 23, 14, 0, tzinfo=UTC),
+        filled_at=None,
+        parent_client_order_id=None,
+        leg_role=None,
+    )
+    report = reconcile(
+        state,
+        broker_positions=[],
+        broker_open_orders=[ours, foreign],
+    )
+    # The foreign top-level order is flagged; ours is not.
+    assert report.broker_order_with_unknown_coid == ["foreign-1"]
+
+
 def test_unknown_coid_surfaced_not_blocking() -> None:
     """Broker has a resting order from some other system. Surface it as
     warning, but it alone should not block new entries."""
