@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Secrets / runtime
+.env
+.env.*
+!.env.example
+
+# Runtime state (NEVER commit live trade logs or state)
+/var/
+state.json
+state.json.tmp
+trades.jsonl
+trades-*.jsonl
+
+# IDE
+.idea/
+.vscode/

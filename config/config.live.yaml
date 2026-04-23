@@ -1,0 +1,82 @@
+# LIVE real-money configuration. Every live-only invariant in
+# strategy/config.py must pass before this file can be loaded.
+#
+# Before using: set ALPACA_API_KEY_LIVE and ALPACA_API_SECRET_LIVE in the
+# process environment. Never commit credentials.
+
+mode: live
+live_allow_non_sip: false        # keep false; SIP required for live
+
+process:
+  lock_file: ./var/trading_bot.lock
+  heartbeat_path: ./var/trading_bot.heartbeat
+  kill_switch_path: ./var/trading_bot.kill
+
+broker:
+  base_url: https://api.alpaca.markets
+  data_feed: sip
+  api_key_env: ALPACA_API_KEY_LIVE
+  api_secret_env: ALPACA_API_SECRET_LIVE
+  request_timeout_s: 10.0
+  max_retries: 3
+  retry_backoff_base_s: 0.5
+  retry_backoff_cap_s: 4.0
+  order_poll_interval_s: 0.5
+  order_poll_timeout_s: 15.0
+
+execution:
+  limit_slippage_bps: 8
+  disaster_stop_atr_mult: 2.0
+  flat_before_close_minutes: 10
+
+sizing:
+  enable_compounding: true
+  starting_equity: 25000
+  position_notional_pct: 0.03    # smaller than paper for tier-0 rollout
+  min_trade_notional: 200
+  max_trade_notional: 1500
+  max_total_exposure_pct: 0.30
+  max_symbol_exposure_pct: 0.08
+  drawdown_throttle_levels:
+    0.02: 0.75
+    0.04: 0.50
+    0.06: 0.25
+  halt_drawdown_pct: 0.08
+
+risk:
+  daily_loss_cap_pct: 0.02       # tighter loss cap for live
+  max_concurrent_positions: 2
+  spread_filter_bps: 15
+  stale_data_max_age_s: 30
+  session_start_utc: "13:35"
+  session_end_utc: "19:45"
+  loss_cooldown_s: 900
+  min_expected_edge_bps: 40
+  block_first_minutes: 5
+  block_last_minutes: 10
+  atr_stop_mult: 1.2
+
+strategy:
+  symbols: [SPY, QQQ]            # smaller universe for live tier-0
+  entry_tf: "5Min"
+  confirm_tf: "15Min"
+  trend_tf: "1Hour"
+  ema_fast: 20
+  ema_slow: 50
+  trend_ema: 200
+  adx_period: 14
+  adx_min: 22                    # slightly stricter regime filter for live
+  atr_period: 14
+  atr_target_mult: 2.0
+  breakout_lookback: 20
+  min_bars_entry_tf: 100
+  min_bars_confirm_tf: 60
+  min_bars_trend_tf: 210
+  reentry_cooldown_bars: 6
+  max_hold_bars: 24
+  tick_interval_s: 10.0
+
+persistence:
+  state_path: ./var/state.json
+  trade_log_path: ./var/trades.jsonl
+  state_fsync: true

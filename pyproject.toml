@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "Production-minded Alpaca intraday trading bot — Phase 1 foundations"
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py==0.33.1",
+    "PyYAML==6.0.2",
+    "python-dateutil==2.9.0.post0",
+    "pytz==2024.2",                   # transitive of alpaca-py data module
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.3.3",
+    "pytest-cov==5.0.0",
+    "pytest-mock==3.14.0",
+    "freezegun==1.5.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["strategy*"]
+exclude = ["tests*", "config*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=strategy",
+    "--cov-report=term-missing",
+    "--cov-branch",
+    "--cov-fail-under=85",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:dateutil.*",
+    # Transitive alpaca-py → websockets.legacy deprecation. Harmless for
+    # our Phase 1 usage (we don't touch the streaming API).
+    "ignore::DeprecationWarning:websockets.legacy.*",
+    "ignore::DeprecationWarning:websockets.*",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["strategy"]
+omit = [
+    # paper_smoke.py is an opt-in live-paper script — its core paths
+    # execute only against a real Alpaca endpoint and are exercised by
+    # running the script, not by pytest. The non-network helpers are
+    # covered by tests/test_paper_smoke.py; excluding the file here
+    # keeps the coverage metric honest about what pytest actually
+    # exercised.
+    "scripts/paper_smoke.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+skip_covered = false
