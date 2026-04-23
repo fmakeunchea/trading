@@ -216,8 +216,25 @@ least once before your first paper-run day, and any time you change
 `broker.py` or bump the `alpaca-py` pin:
 
 ```
-python -m scripts.paper_smoke --yes
+set -o pipefail
+python -m scripts.paper_smoke --yes 2>&1 | tee /tmp/paper_smoke.out
+echo "exit=${PIPESTATUS[0]}"
 ```
+
+**Why the `pipefail`/`PIPESTATUS[0]` dance:** `python | tee` makes `$?`
+return the exit code of the **last** command in the pipeline — which is
+`tee`, and `tee` almost always exits 0. With `set -o pipefail` the
+pipeline's status becomes the first non-zero exit code anywhere in the
+chain, and `${PIPESTATUS[0]}` unambiguously gives us the Python
+process's exit code. Without this, you cannot tell PASS from FAIL by
+looking at `echo $?` alone.
+
+**Run during regular trading hours.** Several stages (`poll_terminal`,
+`reconcile_post_entry`, `flatten`) need the parent to actually fill to
+be meaningful. Submitted after the close, Alpaca parks the order at
+`status=accepted` until the next session — the poll timeout will fire
+and those stages will fail/skip even though the broker is behaving
+correctly.
 
 Exit codes:
 - `0` — all stages pass, cleanup clean

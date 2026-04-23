@@ -306,10 +306,13 @@ def test_submit_builds_exact_oto_request() -> None:
     assert isinstance(req.stop_loss, StopLossRequest)
     assert req.stop_loss.stop_price == pytest.approx(196.00)
 
-    # Return shape
+    # Return shape — linkage established by traversal, not by any field
+    # on the child itself (Alpaca does not populate such a field).
     assert submitted.parent.client_order_id == intent.client_order_id()
     assert submitted.stop_child is not None
     assert submitted.stop_child.parent_client_order_id == intent.client_order_id()
+    assert submitted.stop_child.parent_broker_order_id == str(parent.id)
+    assert submitted.stop_child.leg_role == "stop_child"
 
 
 def test_submit_duplicate_coid_resolves_to_existing() -> None:
@@ -548,13 +551,18 @@ def test_market_close_rejects_nonpositive_qty() -> None:
 
 
 def test_get_open_orders_flattens_legs() -> None:
+    """Traversal-based leg→parent linkage: the leg's parent COID and
+    parent broker id must come from the parent we iterated, regardless
+    of what the SDK populated on the leg object itself."""
     b, client, _ = _broker()
+    # Deliberately leave parent_coid unset on the leg object — the Alpaca
+    # API in practice returns the leg without any parent back-reference.
     stop = _sdk_order(
         broker_id="b-stop",
-        coid="TBv1-stop",
+        coid="ALPACA-UUID-stop",          # Alpaca auto-generates child COIDs
         side=SdkOrderSide.SELL,
         order_class=SdkOrderClass.SIMPLE,
-        parent_coid="TBv1-parent",
+        parent_coid=None,                 # NOT populated by alpaca-py
         order_type="stop",
     )
     parent = _sdk_order(
@@ -568,9 +576,71 @@ def test_get_open_orders_flattens_legs() -> None:
     assert len(out) == 2
     ids = {o.broker_order_id for o in out}
     assert ids == {"b-parent", "b-stop"}
-    # Leg carries parent_client_order_id even if SDK omitted it.
     child = next(o for o in out if o.broker_order_id == "b-stop")
     assert child.parent_client_order_id == "TBv1-parent"
+    assert child.parent_broker_order_id == "b-parent"
+    assert child.leg_role == "stop_child"
+    # Parent has no parent-context itself.
+    parent_dto = next(o for o in out if o.broker_order_id == "b-parent")
+    assert parent_dto.parent_client_order_id is None
+    assert parent_dto.parent_broker_order_id is None
+    assert parent_dto.leg_role == "parent"
+
+
+def test_pick_stop_child_sets_parent_context_without_setattr() -> None:
+    """Regression: pydantic v2 silently refuses setattr for fields not
+    in the model schema. We must not rely on setattr to carry parent
+    context — the test uses an object that raises on setattr to prove
+    _pick_stop_child still populates the DTO correctly.
+    """
+    from strategy.broker import _pick_stop_child
+
+    class _Immutable:
+        """Like a frozen pydantic model — raises on unknown setattr."""
+        def __init__(self, **kw):
+            for k, v in kw.items():
+                object.__setattr__(self, k, v)
+
+        def __setattr__(self, name, value):
+            if name not in self.__dict__:
+                raise AttributeError(f"cannot set {name} on frozen")
+            object.__setattr__(self, name, value)
+
+    leg = _Immutable(
+        id="child-id",
+        client_order_id="alpaca-generated-uuid",
+        symbol="AAPL",
+        side=SdkOrderSide.SELL,
+        qty="10",
+        filled_qty="0",
+        status=SdkOrderStatus.HELD,
+        order_class=SdkOrderClass.OTO,
+        submitted_at=datetime(2026, 4, 23, 14, 0, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        order_type="stop",
+        legs=None,
+    )
+    parent = _Immutable(
+        id="parent-id",
+        client_order_id="TBv1-parent",
+        symbol="AAPL",
+        side=SdkOrderSide.BUY,
+        qty="10",
+        filled_qty="0",
+        status=SdkOrderStatus.ACCEPTED,
+        order_class=SdkOrderClass.OTO,
+        submitted_at=datetime(2026, 4, 23, 14, 0, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        order_type="limit",
+        legs=[leg],
+    )
+    dto = _pick_stop_child(parent)
+    assert dto is not None
+    assert dto.parent_client_order_id == "TBv1-parent"
+    assert dto.parent_broker_order_id == "parent-id"
+    assert dto.leg_role == "stop_child"
 
 
 # ---------------------------------------------------------------------------

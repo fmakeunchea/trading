@@ -340,50 +340,109 @@ def stage_oto_submission(
         )
     )
 
-    # --- Check: the child must be *reliably linkable* to the parent.
-    # We try parent_client_order_id first (what the DTO name promises)
-    # and fall back to the raw-dump's ``parent_id`` field so the smoke
-    # report reflects which linkage actually works.
+    # --- Pass criteria --------------------------------------------------
+    # Alpaca links OTO children to parents by traversal (parent.legs),
+    # not by any field on the child. Our criteria therefore inspect the
+    # parent's structural invariants and the single stop-sell leg.
+    failures: list[str] = []
+    raw_for_checks: dict = raw_dump if isinstance(raw_dump, dict) else {}
+    parent_symbol = str(raw_for_checks.get("symbol") or "")
+    parent_qty = str(raw_for_checks.get("qty") or "")
+    parent_filled_qty = int(raw_for_checks.get("filled_qty") or 0)
+    parent_order_class = str(raw_for_checks.get("order_class") or "").lower()
+    parent_raw_id = str(raw_for_checks.get("id") or "")
+    legs = raw_for_checks.get("legs") or []
+
+    if parent_order_class != "oto":
+        failures.append(f"parent.order_class={parent_order_class!r} (expected 'oto')")
+
+    if not legs:
+        # Warning: OTO parent returned with no legs. The smoke stage
+        # still fails (linkage cannot be verified), but print a
+        # prominent warning because it would force an architecture
+        # discussion if it became common.
+        print("  [WARN] OTO parent returned with no legs — reconciliation "
+              "relies on parent.legs for leg→parent linkage; if this "
+              "recurs, architecture needs review.")
+        failures.append("parent.legs is empty or missing")
+
+    stop_sell_legs = [
+        l for l in legs
+        if "stop" in str(l.get("order_type") or l.get("type") or "").lower()
+        and str(l.get("side") or "").lower() == "sell"
+    ]
+    if legs and len(stop_sell_legs) != 1:
+        failures.append(
+            f"expected exactly one stop-sell leg, got {len(stop_sell_legs)}"
+        )
+
+    if stop_sell_legs:
+        child = stop_sell_legs[0]
+        child_symbol = str(child.get("symbol") or "")
+        child_qty = str(child.get("qty") or "")
+        child_status = str(child.get("status") or "").lower()
+        raw_child_stop = child.get("stop_price")
+        if child_symbol != parent_symbol:
+            failures.append(
+                f"child.symbol={child_symbol!r} != parent.symbol={parent_symbol!r}"
+            )
+        if parent_filled_qty == 0 and child_qty != parent_qty:
+            failures.append(
+                f"child.qty={child_qty!r} != parent.qty={parent_qty!r} (pre-fill)"
+            )
+        # stop_price must equal the intent's disaster_stop_price
+        # (compare as Decimal to avoid "340.63" vs "340.6300" false neg).
+        try:
+            if raw_child_stop is None or Decimal(str(raw_child_stop)) != intent.disaster_stop_price:
+                failures.append(
+                    f"child.stop_price={raw_child_stop!r} != "
+                    f"disaster_stop_price={intent.disaster_stop_price}"
+                )
+        except Exception:  # noqa: BLE001
+            failures.append(f"child.stop_price not parseable: {raw_child_stop!r}")
+        # Child must be in a pre-activation / active state — Alpaca uses
+        # "held" while the parent is pending; once the parent fills,
+        # the child flips to "new" / "accepted".
+        if child_status not in {"held", "new", "accepted", "pending_new"}:
+            failures.append(
+                f"child.status={child_status!r} "
+                f"(expected held/new/accepted/pending_new)"
+            )
+
+    # Also surface the DTO's parent-linkage so a regression in the DTO
+    # mapping (where we now set parent_client_order_id from traversal)
+    # is caught here and not only later in reconciliation.
     if submitted.stop_child is None:
-        report.add("oto_submission", False, "no stop child returned")
-        return None
-
-    parent_coid = intent.client_order_id()
-    parent_raw_id = str(raw_dump.get("id", "")) if isinstance(raw_dump, dict) else ""
-    legs = raw_dump.get("legs") if isinstance(raw_dump, dict) else None
-    child_raw: dict = {}
-    if legs:
-        child_raw = next(
-            (leg for leg in legs if str(leg.get("order_type", leg.get("type", ""))).lower().find("stop") >= 0),
-            legs[0] if legs else {},
-        )
-    child_raw_parent_id = str(child_raw.get("parent_id") or "")
-    child_raw_parent_coid = str(child_raw.get("parent_client_order_id") or "")
-
-    linkage_by_coid = submitted.stop_child.parent_client_order_id == parent_coid
-    linkage_by_raw_parent_id = bool(parent_raw_id) and child_raw_parent_id == parent_raw_id
-
-    details = (
-        f"parent.coid={parent_coid} parent.id={parent_raw_id or '?'} "
-        f"child.coid={submitted.stop_child.client_order_id} "
-        f"child.parent_id={child_raw_parent_id or '?'} "
-        f"child.parent_client_order_id={child_raw_parent_coid or '?'}"
-    )
-    if linkage_by_coid:
-        report.add("oto_submission", True, f"linked via parent_client_order_id — {details}")
-    elif linkage_by_raw_parent_id:
-        report.add(
-            "oto_submission",
-            False,
-            f"linked via raw parent_id only (DTO mapping needs update) — {details}",
-        )
+        failures.append("DTO-mapped stop_child is None")
     else:
-        report.add(
-            "oto_submission",
-            False,
-            f"no reliable parent linkage detected — {details}",
-        )
-    return intent, submitted.stop_child.client_order_id
+        if submitted.stop_child.parent_client_order_id != intent.client_order_id():
+            failures.append(
+                "DTO stop_child.parent_client_order_id="
+                f"{submitted.stop_child.parent_client_order_id!r} "
+                f"!= parent COID {intent.client_order_id()!r}"
+            )
+        if parent_raw_id and submitted.stop_child.parent_broker_order_id != parent_raw_id:
+            failures.append(
+                "DTO stop_child.parent_broker_order_id="
+                f"{submitted.stop_child.parent_broker_order_id!r} "
+                f"!= parent.id {parent_raw_id!r}"
+            )
+        if submitted.stop_child.leg_role != "stop_child":
+            failures.append(
+                f"DTO stop_child.leg_role={submitted.stop_child.leg_role!r} "
+                f"(expected 'stop_child')"
+            )
+
+    summary_details = (
+        f"parent.coid={intent.client_order_id()} parent.id={parent_raw_id or '?'} "
+        f"parent.qty={parent_qty} parent.filled={parent_filled_qty} "
+        f"stop_sell_legs={len(stop_sell_legs)}"
+    )
+    if failures:
+        report.add("oto_submission", False, "; ".join(failures) + f" — {summary_details}")
+    else:
+        report.add("oto_submission", True, summary_details)
+    return intent, (submitted.stop_child.client_order_id if submitted.stop_child else None)
 
 
 def stage_poll_terminal(

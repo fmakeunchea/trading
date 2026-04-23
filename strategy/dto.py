@@ -248,8 +248,17 @@ class OrderIntent:
 class BrokerOrder:
     """Normalised view of an order as the broker sees it.
 
-    Only the fields the bot actually uses. The ``leg_role`` distinguishes
-    OTO parents from OTO stop children during reconciliation.
+    Only the fields the bot actually uses.
+
+    Linkage between a leg and its parent is established by **traversal**
+    from ``parent.legs`` at construction time, not by any field on the
+    leg itself: Alpaca does not populate a back-reference on OTO
+    children. The wrapper records that traversal by setting
+    ``parent_client_order_id`` (parent's COID) and
+    ``parent_broker_order_id`` (parent's server id) on the leg's DTO.
+    ``leg_role`` ("parent" | "stop_child" | "take_profit_child" | None)
+    distinguishes roles so reconciliation does not need to re-derive
+    them from order-type string matching.
     """
 
     broker_order_id: str
@@ -264,7 +273,8 @@ class BrokerOrder:
     submitted_at: datetime
     filled_at: datetime | None
     parent_client_order_id: str | None
-    leg_role: str | None  # "parent" | "stop_child" | None
+    leg_role: str | None  # "parent" | "stop_child" | "take_profit_child" | None
+    parent_broker_order_id: str | None = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES

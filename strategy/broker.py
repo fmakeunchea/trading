@@ -710,12 +710,35 @@ def _to_position(raw: Any) -> Position:
     )
 
 
-def _to_broker_order(raw: Any) -> BrokerOrder:
+def _to_broker_order(
+    raw: Any,
+    *,
+    parent_client_order_id: str | None = None,
+    parent_broker_order_id: str | None = None,
+    leg_role: str | None = None,
+) -> BrokerOrder:
+    """Convert a raw SDK order into a typed :class:`BrokerOrder`.
+
+    ``parent_client_order_id`` / ``parent_broker_order_id`` / ``leg_role``
+    are supplied by callers that have the parent context (i.e. are
+    iterating ``parent.legs``). Alpaca does not populate any
+    back-reference from an OTO child to its parent on the child's own
+    record — observed on paper 2026-04-23 — so the only reliable
+    linkage is the traversal the caller performs.
+
+    For top-level orders the three kwargs are ``None`` and the fields
+    stay empty, which is correct.
+    """
     avg_fill = getattr(raw, "filled_avg_price", None)
     filled_at = getattr(raw, "filled_at", None)
-    parent_coid = getattr(raw, "parent_client_order_id", None) or getattr(
-        raw, "_parent_client_order_id", None
-    )
+    # If no explicit parent context, fall back to whatever the SDK
+    # populated. For top-level orders and for every leg Alpaca has
+    # returned to date, these fall-through values are None.
+    if parent_client_order_id is None:
+        parent_client_order_id = getattr(raw, "parent_client_order_id", None) or getattr(
+            raw, "_parent_client_order_id", None
+        )
+    effective_role = leg_role if leg_role is not None else _derive_leg_role(raw)
     return BrokerOrder(
         broker_order_id=str(raw.id),
         client_order_id=str(raw.client_order_id),
@@ -728,51 +751,82 @@ def _to_broker_order(raw: Any) -> BrokerOrder:
         order_class=_map_order_class(getattr(raw, "order_class", SdkOrderClass.SIMPLE)),
         submitted_at=_coerce_utc(raw.submitted_at),
         filled_at=_coerce_utc(filled_at) if filled_at else None,
-        parent_client_order_id=str(parent_coid) if parent_coid else None,
-        leg_role=_derive_leg_role(raw),
+        parent_client_order_id=(
+            str(parent_client_order_id) if parent_client_order_id else None
+        ),
+        leg_role=effective_role,
+        parent_broker_order_id=(
+            str(parent_broker_order_id) if parent_broker_order_id else None
+        ),
     )
 
 
 def _flatten_orders(raws: list[Any]) -> list[BrokerOrder]:
-    """Flatten nested orders (parent + legs) into a single list."""
+    """Flatten nested orders (parent + legs) into a single list.
+
+    Leg→parent linkage is established by traversal: a leg is known to
+    belong to a parent because we encountered it inside ``parent.legs``.
+    We pass that parent context explicitly into :func:`_to_broker_order`
+    rather than attempting ``setattr`` on the pydantic leg (which is a
+    silent no-op on pydantic v2).
+    """
     out: list[BrokerOrder] = []
     for r in raws:
         out.append(_to_broker_order(r))
+        parent_coid = getattr(r, "client_order_id", None)
+        parent_bid = getattr(r, "id", None)
         for leg in getattr(r, "legs", None) or []:
-            # Ensure the leg carries its parent's COID when the SDK omits it.
-            if not getattr(leg, "parent_client_order_id", None):
-                try:
-                    setattr(leg, "parent_client_order_id", r.client_order_id)
-                except Exception:  # pragma: no cover - read-only SDK objects
-                    pass
-            out.append(_to_broker_order(leg))
+            out.append(
+                _to_broker_order(
+                    leg,
+                    parent_client_order_id=parent_coid,
+                    parent_broker_order_id=str(parent_bid) if parent_bid else None,
+                    leg_role=_role_from_order_type(leg),
+                )
+            )
     return out
 
 
 def _derive_leg_role(raw: Any) -> str | None:
-    # alpaca-py exposes order_type on legs; stop_loss child has type "stop".
-    t = getattr(raw, "order_type", None) or getattr(raw, "type", None)
-    if t is None:
-        return None
-    t_str = str(t).lower()
-    if "stop" in t_str and getattr(raw, "parent_client_order_id", None):
-        return "stop_child"
+    """Role derivation for orders we do *not* have parent context for.
+
+    Callers that do have parent context pass ``leg_role`` explicitly to
+    :func:`_to_broker_order`. This helper only decides between "parent"
+    and ``None`` for top-level orders that may or may not have legs.
+    """
     if getattr(raw, "legs", None):
         return "parent"
     return None
 
 
+def _role_from_order_type(leg: Any) -> str:
+    """Map an alpaca-py leg's ``order_type`` to our leg_role label."""
+    t = getattr(leg, "order_type", None) or getattr(leg, "type", None)
+    t_str = str(t).lower() if t is not None else ""
+    if "stop" in t_str:
+        return "stop_child"
+    if "limit" in t_str:
+        return "take_profit_child"
+    return "child"
+
+
 def _pick_stop_child(raw: Any) -> BrokerOrder | None:
+    """Find the OTO stop_loss leg on a parent order, if any.
+
+    Relies on ``parent.legs`` — the only reliable linkage Alpaca provides.
+    """
     legs = getattr(raw, "legs", None) or []
+    parent_coid = getattr(raw, "client_order_id", None)
+    parent_bid = getattr(raw, "id", None)
     for leg in legs:
         t = getattr(leg, "order_type", None) or getattr(leg, "type", None)
         if t is not None and "stop" in str(t).lower():
-            if not getattr(leg, "parent_client_order_id", None):
-                try:
-                    setattr(leg, "parent_client_order_id", raw.client_order_id)
-                except Exception:  # pragma: no cover
-                    pass
-            return _to_broker_order(leg)
+            return _to_broker_order(
+                leg,
+                parent_client_order_id=parent_coid,
+                parent_broker_order_id=str(parent_bid) if parent_bid else None,
+                leg_role="stop_child",
+            )
     return None
 
 
