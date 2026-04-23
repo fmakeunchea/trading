@@ -1,0 +1,66 @@
+[Unit]
+Description=Alpaca Intraday Trading Bot (paper mode)
+Documentation=https://github.com/fmakeunchea/trading
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# --- Process identity ---
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading-bot
+
+# Credentials (ALPACA_API_KEY, ALPACA_API_SECRET) come from a root-owned,
+# group-readable file. Keep it off disk in backups and never commit it.
+EnvironmentFile=/etc/trading-bot/env
+
+# Force line-buffered stdout/stderr so journal captures logs promptly.
+Environment=PYTHONUNBUFFERED=1
+
+# --- Entrypoint ---
+ExecStart=/opt/trading-bot/.venv/bin/python run_strategy.py --config /opt/trading-bot/config/config.paper.vps.yaml --log-level INFO
+
+# --- Restart policy ---
+# Restart on crashes, not on clean SIGTERM exits. A SIGTERM (planned stop
+# or reboot) exits 0 → systemd does not restart. An unhandled exception
+# exits non-zero → systemd restarts after 30s.
+Restart=on-failure
+RestartSec=30
+# Protect against a crash loop: no more than 5 restarts per 10 minutes.
+# After that the unit goes "failed" and requires operator attention.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# --- Shutdown ---
+# graceful_shutdown calls flatten_symbol for every open trade. Worst case
+# is roughly 4 symbols × ~15s (cancel + poll + close + poll + verify).
+# 180s gives comfortable headroom before SIGKILL.
+TimeoutStopSec=180
+KillMode=mixed
+KillSignal=SIGTERM
+
+# --- Filesystem hardening ---
+# /opt is read-only to this service; only /opt/trading-bot/var is writable
+# (state, trade log, lock, heartbeat, kill switch).
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/trading-bot/var
+PrivateTmp=yes
+
+# --- Process hardening ---
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot-paper
+
+[Install]
+WantedBy=multi-user.target

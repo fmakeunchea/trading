@@ -368,6 +368,22 @@ def test_shipped_live_config_parses_with_live_creds() -> None:
     assert cfg.broker.data_feed == "sip"
 
 
+def test_shipped_vps_paper_config_parses() -> None:
+    """The VPS-specific paper config must parse and its runtime paths
+    must be absolute (so systemd's WorkingDirectory cannot accidentally
+    relocate persistence)."""
+    repo = Path(__file__).resolve().parent.parent
+    env = {"ALPACA_API_KEY": "dummy", "ALPACA_API_SECRET": "dummy"}
+    cfg = load_config(repo / "config" / "config.paper.vps.yaml", env=env)
+    assert cfg.mode == "paper"
+    assert cfg.persistence.state_path.is_absolute()
+    assert cfg.persistence.trade_log_path.is_absolute()
+    assert cfg.process.lock_file.is_absolute()
+    assert cfg.process.heartbeat_path.is_absolute()
+    assert cfg.process.kill_switch_path.is_absolute()
+    assert str(cfg.persistence.state_path).startswith("/opt/trading-bot/")
+
+
 # ---------------------------------------------------------------------------
 # Decimal precision preserved
 # ---------------------------------------------------------------------------
