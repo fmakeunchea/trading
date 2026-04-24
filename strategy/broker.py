@@ -825,12 +825,35 @@ def _flatten_orders(raws: list[Any]) -> list[BrokerOrder]:
 def _derive_leg_role(raw: Any) -> str | None:
     """Role derivation for orders we do *not* have parent context for.
 
-    Callers that do have parent context pass ``leg_role`` explicitly to
-    :func:`_to_broker_order`. This helper only decides between "parent"
-    and ``None`` for top-level orders that may or may not have legs.
+    Callers that have parent context pass ``leg_role`` explicitly to
+    :func:`_to_broker_order`. This helper is only reached for
+    top-level orders.
+
+    Two top-level shapes we recognise here:
+
+    * has ``.legs`` → it's an OTO parent.
+    * ``order_class=oto`` with ``order_type=stop`` (or ``limit``) and
+      no legs → it's a **detached** OTO child: the parent filled, so
+      Alpaca returns the active child as a top-level order without a
+      ``.legs`` array and without a back-reference to the parent.
+      Observed on paper 2026-04-24.
     """
     if getattr(raw, "legs", None):
         return "parent"
+    order_class = getattr(raw, "order_class", None)
+    oc_str = (
+        order_class.value if hasattr(order_class, "value") else str(order_class or "")
+    )
+    if "oto" in str(oc_str).lower():
+        t = getattr(raw, "order_type", None) or getattr(raw, "type", None)
+        t_str = (
+            t.value if hasattr(t, "value") else str(t or "")
+        )
+        t_lower = str(t_str).lower()
+        if "stop" in t_lower:
+            return "stop_child"
+        if "limit" in t_lower:
+            return "take_profit_child"
     return None
 
 

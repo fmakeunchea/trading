@@ -178,6 +178,82 @@ def test_partial_fill_with_orphan_child_detected() -> None:
     assert "AAPL" in report.partial_fill_with_orphan_child
 
 
+def test_reconcile_recognises_detached_stop_child_by_local_state_match() -> None:
+    """Regression (2026-04-24 RTH smoke): once the OTO parent fills on
+    Alpaca, the active stop child is returned by
+    ``get_open_orders(status=OPEN, nested=True)`` as a **standalone
+    top-level order** with no parent linkage on its own record. Our
+    DTO mapping sees ``leg_role=stop_child`` (via _derive_leg_role
+    detecting order_class=OTO + type=stop) but
+    ``parent_client_order_id=None`` and ``parent_broker_order_id=None``.
+    Reconcile must still recognise the child as ours via a lookup
+    against our locally stored ``protective_child_client_order_id``.
+    Before this change the smoke ran
+        unknown_coid=['<child broker id>']
+    which would block entries every tick with an open position.
+    """
+    alpaca_child_coid = "f7fa3282-8611-4e6f-90ee-d28f6ef9a4cb"
+    state = StrategyState()
+    state.open_trades["SPY"] = _open_trade(
+        "SPY", qty=1, child_coid=alpaca_child_coid,
+    )
+    detached_child = BrokerOrder(
+        broker_order_id="b-child",
+        client_order_id=alpaca_child_coid,   # Alpaca-generated UUID, not TBv1-
+        symbol="SPY",
+        side=OrderSide.SELL,
+        qty=1,
+        filled_qty=0,
+        avg_fill_price=None,
+        status=OrderStatus.NEW,
+        order_class=OrderClass.OTO,
+        submitted_at=datetime(2026, 4, 24, tzinfo=UTC),
+        filled_at=None,
+        parent_client_order_id=None,         # NO parent linkage after fill
+        leg_role="stop_child",                # set by _derive_leg_role
+    )
+    report = reconcile(
+        state,
+        broker_positions=[_pos("SPY", qty=1)],
+        broker_open_orders=[detached_child],
+    )
+    assert report.is_clean() is True, (
+        f"detached child must be recognised as ours; got {report}"
+    )
+    assert "b-child" not in report.broker_order_with_unknown_coid
+
+
+def test_reconcile_detached_child_without_local_record_is_still_flagged() -> None:
+    """Safety: a detached OTO stop child whose COID we did NOT record
+    in local state is still treated as foreign — the local-state match
+    clause must not accidentally claim everything that looks like an
+    OTO leg."""
+    alien_child_coid = "somebody-elses-uuid"
+    state = StrategyState()
+    # No open_trades, nothing to match against.
+    detached = BrokerOrder(
+        broker_order_id="alien-child",
+        client_order_id=alien_child_coid,
+        symbol="SPY",
+        side=OrderSide.SELL,
+        qty=1,
+        filled_qty=0,
+        avg_fill_price=None,
+        status=OrderStatus.NEW,
+        order_class=OrderClass.OTO,
+        submitted_at=datetime(2026, 4, 24, tzinfo=UTC),
+        filled_at=None,
+        parent_client_order_id=None,
+        leg_role="stop_child",
+    )
+    report = reconcile(
+        state,
+        broker_positions=[],
+        broker_open_orders=[detached],
+    )
+    assert "alien-child" in report.broker_order_with_unknown_coid
+
+
 def test_real_alpaca_child_uuid_coid_is_still_ours() -> None:
     """Regression: the 2026-04-23 paper smoke confirmed that Alpaca
     auto-generates a UUID ``client_order_id`` on OTO children. The

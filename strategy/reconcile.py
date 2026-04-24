@@ -83,22 +83,48 @@ def reconcile(
         sym: t.protective_child_client_order_id
         for sym, t in state.open_trades.items()
     }
+    # Reverse lookup: Alpaca-assigned child COID → symbol we opened it for.
+    # Used by the post-fill ownership branch below.
+    ours_by_child_coid: dict[str, str] = {
+        t.protective_child_client_order_id: sym
+        for sym, t in state.open_trades.items()
+        if t.protective_child_client_order_id
+    }
     # Count protective-looking orders (OTO children) per symbol.
     protective_by_symbol: dict[str, list[BrokerOrder]] = {}
     for order in open_orders:
         if order.status not in PROTECTIVE_STATUSES:
             continue
-        # Ownership rule (paper-smoke verified 2026-04-23):
-        # Alpaca auto-generates UUID client_order_ids for OTO children,
-        # so we cannot identify ownership from the child's own COID.
-        # The **owning COID** is the parent's ``client_order_id`` for
-        # legs and the order's own ``client_order_id`` for top-level
-        # orders. Ours iff the owning COID starts with our prefix.
+        # Ownership rule v3 (paper-smoke verified 2026-04-23 and
+        # 2026-04-24). An order is ours if either:
+        #
+        # (a) its *owning* COID carries our prefix — owning COID =
+        #     ``parent_client_order_id`` for a leg visible under an
+        #     open parent, or the order's own ``client_order_id`` for
+        #     a top-level order we submitted. Covers the submission
+        #     and active-parent phase.
+        #
+        # (b) the order's own ``client_order_id`` matches a
+        #     ``protective_child_client_order_id`` we recorded in
+        #     local state. Covers the **post-fill detached-leg** case:
+        #     once the parent fills, Alpaca removes it from the
+        #     ``get_open_orders(status=OPEN, nested=True)`` response
+        #     and surfaces the active stop child as a standalone
+        #     top-level order with no parent linkage on its record.
         owning_coid = order.parent_client_order_id or order.client_order_id
-        if not owning_coid or not owning_coid.startswith(coid_prefix):
+        owned_by_prefix = bool(
+            owning_coid and owning_coid.startswith(coid_prefix)
+        )
+        owned_by_local_match = order.client_order_id in ours_by_child_coid
+        if not (owned_by_prefix or owned_by_local_match):
             report.broker_order_with_unknown_coid.append(order.broker_order_id)
             continue
-        if order.leg_role == "stop_child" or order.parent_client_order_id is not None:
+        is_protective = (
+            order.leg_role == "stop_child"
+            or order.parent_client_order_id is not None
+            or owned_by_local_match
+        )
+        if is_protective:
             protective_by_symbol.setdefault(order.symbol, []).append(order)
 
     for sym, orders in protective_by_symbol.items():

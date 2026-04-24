@@ -590,11 +590,17 @@ def stage_reconcile_post_entry(
             skipped=True,
         )
         return True
+    # Match the protective child by shape, not by parent linkage: once
+    # the parent fills, Alpaca returns the child as a standalone
+    # top-level order with no parent back-reference on its own record
+    # (observed 2026-04-24). We match on symbol + OTO + SELL, which is
+    # the active disaster-stop leg for a long OTO entry.
     child = next(
         (
             o for o in open_orders
-            if o.symbol == symbol and o.leg_role == "stop_child"
-            and o.parent_client_order_id == entry_intent.client_order_id()
+            if o.symbol == symbol
+            and o.side is OrderSide.SELL
+            and o.order_class is OrderClass.OTO
         ),
         None,
     )

@@ -771,6 +771,68 @@ def test_coerce_utc_paths() -> None:
     assert out3.tzinfo is timezone.utc
 
 
+def test_derive_leg_role_flags_detached_oto_stop_as_stop_child() -> None:
+    """Regression (2026-04-24 RTH smoke): after the OTO parent fills,
+    the active stop child is returned as a top-level order with no
+    legs. _derive_leg_role must still mark it ``stop_child`` based on
+    ``order_class=OTO`` + ``order_type=stop`` so downstream
+    reconciliation and auditing see the correct role."""
+    from strategy.broker import _derive_leg_role
+    from types import SimpleNamespace
+
+    detached_stop = SimpleNamespace(
+        id="b-child",
+        client_order_id="alpaca-uuid",
+        order_class=SdkOrderClass.OTO,
+        order_type="stop",
+        legs=None,
+        side=SdkOrderSide.SELL,
+    )
+    assert _derive_leg_role(detached_stop) == "stop_child"
+
+    detached_limit = SimpleNamespace(
+        id="b-tp",
+        client_order_id="alpaca-uuid-2",
+        order_class=SdkOrderClass.OTO,
+        order_type="limit",
+        legs=None,
+        side=SdkOrderSide.SELL,
+    )
+    assert _derive_leg_role(detached_limit) == "take_profit_child"
+
+
+def test_derive_leg_role_standalone_simple_order_is_none() -> None:
+    """Top-level SIMPLE orders (e.g. our market-close orders) must not
+    be mis-classified as leg children."""
+    from strategy.broker import _derive_leg_role
+    from types import SimpleNamespace
+
+    standalone = SimpleNamespace(
+        id="b-close",
+        client_order_id="TBv1-close",
+        order_class=SdkOrderClass.SIMPLE,
+        order_type="market",
+        legs=None,
+        side=SdkOrderSide.SELL,
+    )
+    assert _derive_leg_role(standalone) is None
+
+
+def test_derive_leg_role_parent_with_legs_is_parent() -> None:
+    from strategy.broker import _derive_leg_role
+    from types import SimpleNamespace
+
+    parent = SimpleNamespace(
+        id="b-parent",
+        client_order_id="TBv1-parent",
+        order_class=SdkOrderClass.OTO,
+        order_type="limit",
+        legs=[SimpleNamespace(id="child")],
+        side=SdkOrderSide.BUY,
+    )
+    assert _derive_leg_role(parent) == "parent"
+
+
 def test_pick_stop_child_no_legs_returns_none() -> None:
     from strategy.broker import _pick_stop_child
     raw = _sdk_order(legs=None)
