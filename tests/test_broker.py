@@ -801,6 +801,154 @@ def test_flatten_cancel_wait_times_out() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Side normalisation (regression: 2026-04-24 RTH smoke failed with
+# ``unrecognised order/position side: <PositionSide.LONG: 'long'>``
+# because _map_side did not treat alpaca-py position enums as a
+# ``.value``-bearing input. The central normaliser now handles every
+# shape uniformly.)
+# ---------------------------------------------------------------------------
+
+
+def test_normalise_side_str_from_alpaca_position_side_enum() -> None:
+    """Alpaca returns PositionSide.LONG / SHORT on positions. The
+    normaliser must read ``.value``, not ``str(enum)``."""
+    from alpaca.trading.enums import PositionSide
+    from strategy.broker import _normalise_side_str
+    assert _normalise_side_str(PositionSide.LONG) == "long"
+    assert _normalise_side_str(PositionSide.SHORT) == "short"
+
+
+def test_normalise_side_str_from_alpaca_order_side_enum() -> None:
+    from alpaca.trading.enums import OrderSide as SdkOrderSide
+    from strategy.broker import _normalise_side_str
+    assert _normalise_side_str(SdkOrderSide.BUY) == "buy"
+    assert _normalise_side_str(SdkOrderSide.SELL) == "sell"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("buy", "buy"),
+        ("BUY", "buy"),
+        ("  Buy ", "buy"),
+        ("sell", "sell"),
+        ("SELL", "sell"),
+        ("long", "long"),
+        ("LONG", "long"),
+        ("short", "short"),
+        ("Short", "short"),
+    ],
+)
+def test_normalise_side_str_from_plain_strings(raw: str, expected: str) -> None:
+    from strategy.broker import _normalise_side_str
+    assert _normalise_side_str(raw) == expected
+
+
+def test_normalise_side_str_rejects_none() -> None:
+    from strategy.broker import _normalise_side_str
+    with pytest.raises(PermanentBrokerError):
+        _normalise_side_str(None)
+
+
+def test_normalise_side_str_rejects_empty_and_whitespace() -> None:
+    from strategy.broker import _normalise_side_str
+    with pytest.raises(PermanentBrokerError):
+        _normalise_side_str("")
+    with pytest.raises(PermanentBrokerError):
+        _normalise_side_str("   ")
+    with pytest.raises(PermanentBrokerError):
+        _normalise_side_str("\t\n")
+
+
+def test_map_side_accepts_alpaca_position_side() -> None:
+    from alpaca.trading.enums import PositionSide
+    from strategy.broker import _map_side
+    assert _map_side(PositionSide.LONG) is OrderSide.BUY
+    assert _map_side(PositionSide.SHORT) is OrderSide.SELL
+
+
+def test_map_side_accepts_alpaca_order_side() -> None:
+    from alpaca.trading.enums import OrderSide as SdkOrderSide
+    from strategy.broker import _map_side
+    assert _map_side(SdkOrderSide.BUY) is OrderSide.BUY
+    assert _map_side(SdkOrderSide.SELL) is OrderSide.SELL
+
+
+def test_map_side_accepts_plain_strings() -> None:
+    from strategy.broker import _map_side
+    assert _map_side("LONG") is OrderSide.BUY
+    assert _map_side("long") is OrderSide.BUY
+    assert _map_side("BUY") is OrderSide.BUY
+    assert _map_side("buy") is OrderSide.BUY
+    assert _map_side("SHORT") is OrderSide.SELL
+    assert _map_side("short") is OrderSide.SELL
+    assert _map_side("SELL") is OrderSide.SELL
+    assert _map_side("sell") is OrderSide.SELL
+
+
+def test_map_side_rejects_unknown() -> None:
+    from strategy.broker import _map_side
+    with pytest.raises(PermanentBrokerError, match="unrecognised"):
+        _map_side("diagonal")
+    with pytest.raises(PermanentBrokerError):
+        _map_side(None)
+
+
+def test_get_positions_handles_alpaca_position_side_enum() -> None:
+    """Exact regression for the 2026-04-24 RTH smoke failure:
+    ``get_positions()`` must not raise when Alpaca returns
+    ``PositionSide.LONG`` on a position record.
+    """
+    from alpaca.trading.enums import PositionSide
+    b, client, _ = _broker()
+    client.get_all_positions.return_value = [
+        SimpleNamespace(
+            symbol="SPY", qty="1",
+            avg_entry_price="500.00",
+            market_value="500.00",
+            unrealized_pl="0",
+            side=PositionSide.LONG,
+        )
+    ]
+    positions = b.get_positions()
+    assert len(positions) == 1
+    assert positions[0].symbol == "SPY"
+    assert positions[0].side is OrderSide.BUY
+
+
+def test_flatten_symbol_handles_alpaca_position_side_enum() -> None:
+    """Regression: ``flatten_symbol``'s verification step fetches
+    positions post-close. That call was raising on ``PositionSide.LONG``
+    too, aborting the flatten sequence mid-way."""
+    from alpaca.trading.enums import PositionSide
+    b, client, _ = _broker(poll_timeout_s=1.0)
+    # No residual open orders on the symbol; two calls (list + poll).
+    client.get_orders.side_effect = [[], []]
+    before = SimpleNamespace(
+        symbol="SPY", qty="1",
+        avg_entry_price="500.00",
+        market_value="500.00",
+        unrealized_pl="0",
+        side=PositionSide.LONG,
+    )
+    client.get_all_positions.side_effect = [[before], []]
+    close = _sdk_order(
+        broker_id="close-1",
+        coid="TBv1-close",
+        side=SdkOrderSide.SELL,
+        qty=1,
+        filled_qty=1,
+        status=SdkOrderStatus.FILLED,
+        order_class=SdkOrderClass.SIMPLE,
+        filled_avg_price="500.05",
+    )
+    client.submit_order.return_value = close
+    client.get_order_by_client_id.return_value = close
+    result = b.flatten_symbol("SPY", close_client_order_id="TBv1-close")
+    assert result.final_position_qty == 0
+
+
+# ---------------------------------------------------------------------------
 # Market-data methods
 # ---------------------------------------------------------------------------
 

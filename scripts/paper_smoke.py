@@ -69,7 +69,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
-from strategy.broker import AlpacaBroker, BarTimeframe, RetryPolicy
+from strategy.broker import (
+    AlpacaBroker,
+    BarTimeframe,
+    RetryPolicy,
+    _normalise_side_str,
+)
 from strategy.dto import (
     COID_PREFIX,
     OrderClass,
@@ -366,10 +371,19 @@ def stage_oto_submission(
               "recurs, architecture needs review.")
         failures.append("parent.legs is empty or missing")
 
+    # Use the central side normaliser so any variant Alpaca ever
+    # returns (enum .value, enum repr, capitalised string, etc.) is
+    # handled identically — no ad hoc str().lower() here.
+    def _leg_side(l: dict) -> str | None:
+        try:
+            return _normalise_side_str(l.get("side"))
+        except StrategyError:
+            return None
+
     stop_sell_legs = [
         l for l in legs
         if "stop" in str(l.get("order_type") or l.get("type") or "").lower()
-        and str(l.get("side") or "").lower() == "sell"
+        and _leg_side(l) == "sell"
     ]
     if legs and len(stop_sell_legs) != 1:
         failures.append(
@@ -507,13 +521,61 @@ def stage_reconcile_post_entry(
     entry_intent: OrderIntent,
 ) -> bool:
     """After a filled entry, a fresh reconcile should be clean provided
-    local state correctly records the open trade."""
+    local state correctly records the open trade.
+
+    Also prints a diagnostic dump of what ``get_open_orders`` and
+    ``get_positions`` actually returned from Alpaca, so the operator
+    can see whether the OTO stop child is visible after the parent
+    filled. Use this to decide whether a follow-up ``nested=False``
+    query is required for reconciliation to see active children.
+    """
     try:
         positions = broker.get_positions()
         open_orders = broker.get_open_orders()
     except StrategyError as exc:
         report.add("reconcile_post_entry", False, f"query failed: {exc}")
         return False
+
+    # Diagnostic: raw post-fill view. Expected shape: at least one
+    # position on ``symbol`` and — if the child remains open — at least
+    # one stop-sell order on ``symbol``. If positions has the symbol
+    # but open_orders does not, the OTO child is invisible to our
+    # reconciliation query and we have a second bug to chase.
+    print("  [diagnostic] post-fill positions (broker truth):")
+    print(
+        json.dumps(
+            [
+                {
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "avg_entry_price": str(p.avg_entry_price),
+                    "side": p.side.value,
+                }
+                for p in positions
+            ],
+            indent=2,
+        )
+    )
+    print("  [diagnostic] post-fill open_orders (broker truth):")
+    print(
+        json.dumps(
+            [
+                {
+                    "broker_order_id": o.broker_order_id,
+                    "client_order_id": o.client_order_id,
+                    "symbol": o.symbol,
+                    "side": o.side.value,
+                    "order_class": o.order_class.value,
+                    "status": o.status.value,
+                    "leg_role": o.leg_role,
+                    "parent_client_order_id": o.parent_client_order_id,
+                    "parent_broker_order_id": o.parent_broker_order_id,
+                }
+                for o in open_orders
+            ],
+            indent=2,
+        )
+    )
 
     # Build a synthetic StrategyState that reflects what the orchestrator
     # would have: one open trade on ``symbol`` with matching protective

@@ -178,21 +178,56 @@ def _map_status(sdk_status: Any) -> OrderStatus:
         return OrderStatus.UNKNOWN
 
 
-def _map_side(side: Any) -> OrderSide:
-    """Map SDK order/position sides to our OrderSide enum.
+def _normalise_side_str(side: Any) -> str:
+    """Canonical lowercase string for any side-like input.
 
-    Alpaca uses ``buy``/``sell`` on orders and ``long``/``short`` on
-    positions. We normalise long → BUY and short → SELL so positions
-    flow through the same type.
+    Every comparison involving a side — order side (``buy`` / ``sell``),
+    position side (``long`` / ``short``), SDK enum, or operator-typed
+    string — must route through this function. alpaca-py's
+    ``PositionSide`` is a plain :class:`enum.Enum` whose ``str(member)``
+    returns ``"PositionSide.LONG"``, not ``"long"``; relying on
+    ``str(side).lower()`` silently mis-classified every real position
+    in the 2026-04-24 paper smoke run.
+
+    Rules:
+
+    * If ``side`` exposes ``.value`` (any enum), use it.
+    * Otherwise ``str(side)``.
+    * Strip whitespace and lowercase the result.
+    * ``None`` or an empty string → :class:`PermanentBrokerError`.
+
+    We fail closed rather than guess because a mis-classified side
+    (long → short) in downstream reconciliation is the worst possible
+    silent-wrong outcome for real money.
     """
-    if isinstance(side, SdkOrderSide):
-        return OrderSide(side.value)
-    raw = str(side).lower()
-    if raw in ("buy", "long"):
+    if side is None:
+        raise PermanentBrokerError("side value is None")
+    raw = side.value if hasattr(side, "value") else side
+    text = str(raw).strip().lower()
+    if not text:
+        raise PermanentBrokerError(f"side value is empty: {side!r}")
+    return text
+
+
+# Accepted canonical forms. Longs map to BUY, shorts map to SELL so
+# positions and orders flow through the same :class:`OrderSide` enum
+# everywhere downstream.
+_LONG_ALIASES: frozenset[str] = frozenset({"buy", "long"})
+_SHORT_ALIASES: frozenset[str] = frozenset({"sell", "short"})
+
+
+def _map_side(side: Any) -> OrderSide:
+    """Map any side-like input to :class:`OrderSide`.
+
+    Accepts every shape that :func:`_normalise_side_str` accepts.
+    Rejects anything that doesn't canonicalise to one of the four known
+    aliases — no silent defaults.
+    """
+    raw = _normalise_side_str(side)
+    if raw in _LONG_ALIASES:
         return OrderSide.BUY
-    if raw in ("sell", "short"):
+    if raw in _SHORT_ALIASES:
         return OrderSide.SELL
-    # Fail closed — any other value is dangerous to default.
     raise PermanentBrokerError(f"unrecognised order/position side: {side!r}")
 
 
@@ -997,7 +1032,9 @@ __all__ = [
     "BarTimeframe",
     "RetryPolicy",
     "_classify",
+    "_map_side",
     "_map_status",
+    "_normalise_side_str",
     "APIError",
     "LimitOrderRequest",
     "StopLossRequest",
