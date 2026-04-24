@@ -4,6 +4,13 @@ Documentation=https://github.com/fmakeunchea/trading
 After=network-online.target
 Wants=network-online.target
 
+# Crash-loop protection: no more than 5 restarts per 10 minutes. After
+# that the unit goes "failed" and requires operator attention. On
+# modern systemd (>=240) these keys MUST live in [Unit], not [Service]
+# — Ubuntu 24.04 systemd ignores them in [Service] with a warning.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
 [Service]
 # --- Process identity ---
 Type=simple
@@ -27,10 +34,6 @@ ExecStart=/opt/trading-bot/.venv/bin/python run_strategy.py --config /opt/tradin
 # exits non-zero → systemd restarts after 30s.
 Restart=on-failure
 RestartSec=30
-# Protect against a crash loop: no more than 5 restarts per 10 minutes.
-# After that the unit goes "failed" and requires operator attention.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 # --- Shutdown ---
 # graceful_shutdown calls flatten_symbol for every open trade. Worst case

@@ -37,6 +37,14 @@ from strategy.trade_log import TradeLog
 log = logging.getLogger("run_strategy")
 
 
+# How often (in ticks) to emit an "alive" status line at INFO level so
+# operators watching ``journalctl -f`` see proof of life during quiet
+# periods (e.g. market closed, no signals). At a 10s tick interval
+# 30 ticks = 5 minutes — enough to be reassuring without filling the
+# journal. Set to 0 to disable.
+STATUS_LOG_EVERY_N_TICKS = 30
+
+
 # ---------------------------------------------------------------------------
 # PID lock file — prevents two instances from racing the same account
 # ---------------------------------------------------------------------------
@@ -153,7 +161,19 @@ def run_loop(
     the loop reads it each iteration. This keeps the loop free of
     global state while still responding to SIGTERM.
     """
-    strategy.recover(now_fn())
+    recovery = strategy.recover(now_fn())
+    log.info(
+        "recovery complete: halted=%s halt_reason=%s open_trades=%d "
+        "repaired=%s dropped=%s unrecoverable=%s",
+        recovery.halted,
+        recovery.halt_reason,
+        len(strategy.state.open_trades),
+        recovery.repaired_extra_positions or [],
+        recovery.dropped_missing_positions or [],
+        recovery.unrecoverable or [],
+    )
+
+    tick_count = 0
     while not stop_flag.get("stop"):
         now = now_fn()
         try:
@@ -165,6 +185,26 @@ def run_loop(
             strategy.tick(now, kill_switch_present=kill_present)
         except Exception:  # noqa: BLE001 — tick must never crash the loop silently
             log.exception("tick raised; continuing next iteration")
+
+        tick_count += 1
+        if (
+            STATUS_LOG_EVERY_N_TICKS > 0
+            and tick_count % STATUS_LOG_EVERY_N_TICKS == 0
+        ):
+            active_halts = [
+                name for name, rec in strategy.state.halts.items() if rec.active
+            ]
+            in_session = strategy.session_clock.is_within_session(now)
+            log.info(
+                "alive: ticks=%d open_trades=%d equity=%s "
+                "in_session=%s halts=%s kill_switch=%s",
+                tick_count,
+                len(strategy.state.open_trades),
+                strategy.state.last_reconciled_equity,
+                in_session,
+                active_halts or "none",
+                kill_present,
+            )
         sleep_fn(cfg.strategy.tick_interval_s)
 
 
@@ -180,11 +220,29 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     cfg = load_config(args.config)
+    log.info(
+        "trading bot starting: pid=%d mode=%s config=%s data_feed=%s symbols=%s "
+        "tick_interval_s=%s",
+        os.getpid(),
+        cfg.mode,
+        args.config,
+        cfg.broker.data_feed,
+        list(cfg.strategy.symbols),
+        cfg.strategy.tick_interval_s,
+    )
     lock = _ProcessLock(cfg.process.lock_file)
     lock.acquire()
+    log.info("process lock acquired: %s", cfg.process.lock_file)
 
     stop_flag: dict = {"stop": False, "flatten": True}
     strategy = build_strategy(cfg)
+    log.info(
+        "strategy built; entering main loop (session_window_utc=%s–%s, "
+        "flat_before_close_min=%d)",
+        cfg.risk.session_start_utc.strftime("%H:%M"),
+        cfg.risk.session_end_utc.strftime("%H:%M"),
+        cfg.execution.flat_before_close_minutes,
+    )
 
     def _handle_signal(signum, frame):  # noqa: ARG001
         log.warning("received signal %s; requesting graceful shutdown", signum)
@@ -199,9 +257,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             now = now_utc()
             in_session = strategy.session_clock.is_within_session(now)
-            strategy.graceful_shutdown(now, flatten=in_session and stop_flag.get("flatten", True))
+            flatten = in_session and stop_flag.get("flatten", True)
+            log.info(
+                "graceful shutdown: in_session=%s flatten=%s open_trades=%d",
+                in_session, flatten, len(strategy.state.open_trades),
+            )
+            strategy.graceful_shutdown(now, flatten=flatten)
         finally:
             lock.release()
+            log.info("process lock released; exiting")
     return 0
 
 

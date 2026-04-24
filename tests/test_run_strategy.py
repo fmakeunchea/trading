@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -76,6 +77,21 @@ def test_pid_is_live_self() -> None:
 def _fake_strategy(kill_switch_seen: list[bool] | None = None,
                    tick_side_effect=None) -> MagicMock:
     s = MagicMock()
+    # Real containers + a real Decimal so the loop's INFO log lines
+    # (``len(strategy.state.open_trades)``, active halts, equity) can
+    # run without auto-MagicMock blowing up on ``len()``.
+    s.state.open_trades = {}
+    s.state.halts = {}
+    s.state.last_reconciled_equity = Decimal("0")
+    s.session_clock.is_within_session.return_value = False
+    recovery = MagicMock()
+    recovery.halted = False
+    recovery.halt_reason = None
+    recovery.repaired_extra_positions = []
+    recovery.dropped_missing_positions = []
+    recovery.unrecoverable = []
+    s.recover.return_value = recovery
+
     def _tick(now, *, kill_switch_present):
         if kill_switch_seen is not None:
             kill_switch_seen.append(kill_switch_present)
