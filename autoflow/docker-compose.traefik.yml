@@ -1,0 +1,84 @@
+# Production overlay for VPS deploys behind the existing Traefik instance
+# at /root/docker-compose.yml. Apply with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+#
+# Effects vs. the base file:
+#   - web + api join the existing Traefik network (root_default, external)
+#   - web + api drop their host port bindings (Traefik fronts both)
+#   - postgres keeps its loopback binding (no public exposure)
+#   - Traefik labels route:
+#       https://autoflowtrader.com/      -> web:3000
+#       https://autoflowtrader.com/api/  -> api:8000  (prefix stripped)
+#   - HTTP basic auth via a single middleware applied to both routers.
+#   - Reuses the existing Let's Encrypt resolver "mytlschallenge".
+#
+# Required env vars (in autoflow/.env):
+#   PUBLIC_HOST=autoflowtrader.com
+#   AUTOFLOW_BASIC_AUTH=user:$$apr1$$...   # output of htpasswd, $ doubled
+#   NEXT_PUBLIC_API_URL=/api
+#   CORS_ORIGINS=https://autoflowtrader.com
+
+services:
+  postgres:
+    # Unchanged — internal only, no labels.
+    networks:
+      - default
+
+  api:
+    networks:
+      - default
+      - traefik
+    # No host port; Traefik reaches it via the docker network.
+    ports: !reset []
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=root_default
+
+      # /api/* router — strip the prefix before forwarding so FastAPI sees
+      # /health, /status, etc. without code changes.
+      - traefik.http.routers.autoflow-api.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api`)
+      - traefik.http.routers.autoflow-api.entrypoints=websecure
+      - traefik.http.routers.autoflow-api.tls=true
+      - traefik.http.routers.autoflow-api.tls.certresolver=mytlschallenge
+      - traefik.http.routers.autoflow-api.priority=20
+      - traefik.http.routers.autoflow-api.service=autoflow-api
+      - traefik.http.routers.autoflow-api.middlewares=autoflow-strip@docker,autoflow-auth@docker
+
+      - traefik.http.services.autoflow-api.loadbalancer.server.port=8000
+
+      - traefik.http.middlewares.autoflow-strip.stripprefix.prefixes=/api
+      - traefik.http.middlewares.autoflow-auth.basicauth.users=${AUTOFLOW_BASIC_AUTH}
+      - traefik.http.middlewares.autoflow-auth.basicauth.removeheader=true
+
+  web:
+    networks:
+      - default
+      - traefik
+    ports: !reset []
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=root_default
+
+      # Catch-all for the host (lower priority than the /api router).
+      - traefik.http.routers.autoflow-web.rule=Host(`${PUBLIC_HOST}`)
+      - traefik.http.routers.autoflow-web.entrypoints=websecure
+      - traefik.http.routers.autoflow-web.tls=true
+      - traefik.http.routers.autoflow-web.tls.certresolver=mytlschallenge
+      - traefik.http.routers.autoflow-web.priority=10
+      - traefik.http.routers.autoflow-web.service=autoflow-web
+      - traefik.http.routers.autoflow-web.middlewares=autoflow-auth@docker
+
+      - traefik.http.services.autoflow-web.loadbalancer.server.port=3000
+
+  trading-bot:
+    # Unchanged — internal only, no labels, profile-gated.
+    networks:
+      - default
+
+networks:
+  default:
+    # Inherit base behaviour
+  traefik:
+    name: root_default
+    external: true
