@@ -46,7 +46,13 @@ services:
       - "127.0.0.1:8000:8000"
 
   web:
-    build: ./web
+    build:
+      context: ./web
+      args:
+        # Baked into the client bundle at build time. Browser uses this to
+        # reach the API. Defaults to the local-dev URL; set to "/api" in
+        # the .env when deploying behind a reverse proxy on the same origin.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     restart: unless-stopped
     logging: *default-logging
     depends_on:
