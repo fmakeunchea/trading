@@ -132,6 +132,11 @@ class Strategy:
     One instance per process. Not thread-safe by design.
     """
 
+    # Throttle window for per-(symbol, decision_kind, reason) diagnostic
+    # records. Engine ticks every ~10s; without throttling we'd emit
+    # dozens of identical "trend_not_up" lines per 5 min per symbol.
+    DIAG_THROTTLE_S = 300
+
     def __init__(
         self,
         config: Config,
@@ -151,6 +156,57 @@ class Strategy:
             block_last_minutes=config.risk.block_last_minutes,
             flat_before_close_minutes=config.execution.flat_before_close_minutes,
         )
+        # Per-(symbol, decision_kind, reason) → last emit timestamp.
+        # Populated by _emit_diagnostic; never read in trading code paths.
+        self._diag_last_emit: dict[tuple[str, str, str], datetime] = {}
+
+    # ---- observability ----------------------------------------------
+
+    def _emit_diagnostic(
+        self,
+        now: datetime,
+        symbol: str,
+        decision_kind: str,
+        reason: str,
+        extra: dict | None = None,
+    ) -> None:
+        """Log + (paper-mode only) audit a per-symbol decision.
+
+        Throttled to once per :attr:`DIAG_THROTTLE_S` seconds per
+        (symbol, decision_kind, reason) tuple. Never raises — diagnostics
+        must not interfere with trading. ``decision_kind`` is one of
+        ``no_signal`` / ``risk_denied`` / ``evaluated``.
+        """
+        key = (symbol, decision_kind, reason)
+        last = self._diag_last_emit.get(key)
+        if last is not None and (now - last).total_seconds() < self.DIAG_THROTTLE_S:
+            return
+        self._diag_last_emit[key] = now
+
+        log.info(
+            "evaluated symbol=%s decision=%s reason=%s%s",
+            symbol,
+            decision_kind,
+            reason,
+            f" {extra}" if extra else "",
+        )
+
+        # Audit-log the decision in paper mode so trades.jsonl exists
+        # even on no-trade days. Live mode keeps the audit lean.
+        if self.config.mode != "paper":
+            return
+        try:
+            payload = {
+                "kind": "DIAGNOSTIC",
+                "decision": decision_kind,
+                "symbol": symbol,
+                "reason": reason,
+            }
+            if extra:
+                payload["extra"] = extra
+            self.trade_log.append_incident(payload)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to append diagnostic to trade_log")
 
     # ---- accessors for tests / driver -------------------------------
 
@@ -626,13 +682,16 @@ class Strategy:
         # --- fetch market data ---------------------------------------
         frame = self._fetch_bar_frame(symbol, now)
         if frame is None:
+            self._emit_diagnostic(now, symbol, "no_signal", "no_bar_frame")
             return None
-        sig = evaluate_signal(frame, self.config.strategy)
+        sig, sig_reason = evaluate_signal(frame, self.config.strategy)
         if sig is None:
+            self._emit_diagnostic(now, symbol, "no_signal", sig_reason)
             return None
         try:
             quote = self.broker.get_latest_quote(symbol)
         except StrategyError:
+            self._emit_diagnostic(now, symbol, "no_signal", "quote_fetch_failed")
             return None
         # --- risk gate -----------------------------------------------
         latest_bar_ts = frame.entry_bars[-1].ts
@@ -665,6 +724,10 @@ class Strategy:
                     "throttle_multiplier": str(decision.throttle),
                 }
             )
+            # Throttled human-readable mirror of the deny — the INTENT
+            # record above is the audit ground truth, this is for
+            # operator observability when nothing is trading.
+            self._emit_diagnostic(now, symbol, "risk_denied", decision.reason)
             return decision
         assert decision.qty > 0 and decision.limit_price is not None
         assert decision.disaster_stop_price is not None and decision.stop_price is not None

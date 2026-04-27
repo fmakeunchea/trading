@@ -151,8 +151,8 @@ def test_evaluate_signal_is_deterministic() -> None:
     """Same inputs must produce byte-identical outputs across repeated calls."""
     cfg = _cfg()
     frame = _good_frame()
-    s1 = evaluate_signal(frame, cfg)
-    s2 = evaluate_signal(frame, cfg)
+    s1, _ = evaluate_signal(frame, cfg)
+    s2, _ = evaluate_signal(frame, cfg)
     assert s1 is not None and s2 is not None
     assert s1 == s2
     # Re-serialising must be stable too.
@@ -171,8 +171,8 @@ def test_evaluate_signal_is_deterministic() -> None:
 def test_determinism_across_frame_rebuild() -> None:
     """Building the frame twice (rebuilding tuples) must yield the same signal."""
     cfg = _cfg()
-    s1 = evaluate_signal(_good_frame(), cfg)
-    s2 = evaluate_signal(_good_frame(), cfg)
+    s1, _ = evaluate_signal(_good_frame(), cfg)
+    s2, _ = evaluate_signal(_good_frame(), cfg)
     assert s1 == s2
 
 
@@ -203,7 +203,7 @@ def test_no_io_during_signal(monkeypatch) -> None:
 
     cfg = _cfg()
     frame = _good_frame()
-    s = evaluate_signal(frame, cfg)
+    s, _ = evaluate_signal(frame, cfg)
     # Signal should have been evaluated successfully with no open() or
     # socket() calls attributable to the signal code path.
     assert s is not None
@@ -224,8 +224,9 @@ def test_no_io_during_signal(monkeypatch) -> None:
 
 def test_good_frame_produces_buy_signal() -> None:
     cfg = _cfg()
-    s = evaluate_signal(_good_frame(), cfg)
+    s, reason = evaluate_signal(_good_frame(), cfg)
     assert s is not None
+    assert reason == "breakout_with_trend_and_confirmation"
     assert s.direction is OrderSide.BUY
     assert s.ref_price > 0
     assert s.atr > 0
@@ -246,7 +247,9 @@ def test_insufficient_bars_returns_none() -> None:
         confirm_bars=frame.confirm_bars,
         trend_bars=frame.trend_bars,
     )
-    assert evaluate_signal(short, cfg) is None
+    sig, reason = evaluate_signal(short, cfg)
+    assert sig is None
+    assert reason == "insufficient_bars"
 
 
 def test_trend_down_blocks_entry() -> None:
@@ -267,7 +270,9 @@ def test_trend_down_blocks_entry() -> None:
         confirm_bars=frame.confirm_bars,
         trend_bars=tuple(down),
     )
-    assert evaluate_signal(bad, cfg) is None
+    sig, reason = evaluate_signal(bad, cfg)
+    assert sig is None
+    assert reason == "trend_not_up"
 
 
 def test_confirm_fast_below_slow_blocks_entry() -> None:
@@ -288,7 +293,9 @@ def test_confirm_fast_below_slow_blocks_entry() -> None:
         confirm_bars=tuple(down),
         trend_bars=frame.trend_bars,
     )
-    assert evaluate_signal(bad, cfg) is None
+    sig, reason = evaluate_signal(bad, cfg)
+    assert sig is None
+    assert reason == "confirmation_not_aligned"
 
 
 def test_no_breakout_blocks_entry() -> None:
@@ -303,7 +310,9 @@ def test_no_breakout_blocks_entry() -> None:
     )
     bars = tuple(list(frame.entry_bars[:-1]) + [tamed_last])
     bad = BarFrame(symbol="AAPL", entry_bars=bars, confirm_bars=frame.confirm_bars, trend_bars=frame.trend_bars)
-    assert evaluate_signal(bad, cfg) is None
+    sig, reason = evaluate_signal(bad, cfg)
+    assert sig is None
+    assert reason == "no_breakout"
 
 
 def test_flat_tape_fails_adx_regime() -> None:
@@ -319,7 +328,9 @@ def test_flat_tape_fails_adx_regime() -> None:
         confirm_bars=_good_frame().confirm_bars,
         trend_bars=_good_frame().trend_bars,
     )
-    assert evaluate_signal(frame, cfg) is None
+    sig, reason = evaluate_signal(frame, cfg)
+    assert sig is None
+    assert reason == "adx_too_low"
 
 
 def test_zero_close_refused_gracefully() -> None:
@@ -329,7 +340,11 @@ def test_zero_close_refused_gracefully() -> None:
     broken = replace(last, close=Decimal(0), open=Decimal(0), high=Decimal(0), low=Decimal(0))
     bars = tuple(list(frame.entry_bars[:-1]) + [broken])
     bad = BarFrame(symbol=frame.symbol, entry_bars=bars, confirm_bars=frame.confirm_bars, trend_bars=frame.trend_bars)
-    assert evaluate_signal(bad, cfg) is None
+    sig, reason = evaluate_signal(bad, cfg)
+    assert sig is None
+    # Either ATR-or-price-nonpositive or close-below-entry-EMA is acceptable
+    # depending on which check trips first; both indicate a degenerate bar.
+    assert reason in {"atr_or_price_nonpositive", "close_below_entry_ema", "atr_regime_out_of_band"}
 
 
 # ---------------------------------------------------------------------------

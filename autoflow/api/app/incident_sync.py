@@ -41,13 +41,27 @@ def _parse_ts(rec: dict) -> datetime:
 
 
 def sync_once() -> None:
+    """Mirror engine trade-log records into Postgres.
+
+    Engine record shape is:
+        {"kind": "INCIDENT|RESULT|...", "ts": ..., "payload": {...},
+         "prev_hash": ..., "line_hash": ...}
+
+    Almost every interesting field (symbol, reason, side, qty, etc.) lives
+    inside `payload`. Earlier versions of this module read the top-level
+    keys, which silently produced rows full of nulls.
+    """
     with db_session() as db:
         for rec in engine_io.iter_trade_log():
-            kind = rec.get("kind")
-            if kind not in {"INCIDENT", "RESULT"}:
+            top_kind = rec.get("kind")
+            if top_kind not in {"INCIDENT", "RESULT"}:
                 continue
+            payload = rec.get("payload", {}) or {}
             source_id = _stable_source_id(rec)
-            if kind == "INCIDENT":
+            if top_kind == "INCIDENT":
+                # Sub-kind ("HALT", "RECONCILE", "DIAGNOSTIC", ...) is in
+                # payload["kind"]; required by the engine for INCIDENT records.
+                sub_kind = payload.get("kind") or "INCIDENT"
                 db.execute(
                     text(
                         """
@@ -61,16 +75,16 @@ def sync_once() -> None:
                     ),
                     {
                         "source_id": source_id,
-                        "kind": rec.get("phase") or rec.get("subtype") or "INCIDENT",
-                        "severity": rec.get("severity", "info"),
-                        "phase": rec.get("phase"),
-                        "symbols": rec.get("symbols") or [],
-                        "reason": rec.get("reason"),
+                        "kind": sub_kind,
+                        "severity": payload.get("severity", "info"),
+                        "phase": payload.get("phase"),
+                        "symbols": _as_symbol_list(payload),
+                        "reason": payload.get("reason"),
                         "payload": json.dumps(rec, default=str),
                         "occurred_at": _parse_ts(rec),
                     },
                 )
-            elif kind == "RESULT":
+            else:  # RESULT
                 db.execute(
                     text(
                         """
@@ -84,18 +98,29 @@ def sync_once() -> None:
                     ),
                     {
                         "source_id": source_id,
-                        "symbol": rec.get("symbol", ""),
-                        "side": (rec.get("side") or "buy").lower(),
-                        "qty": float(rec.get("qty") or 0),
-                        "avg_fill_price": _maybe_float(rec.get("avg_fill_price")),
-                        "status": rec.get("status", "unknown"),
-                        "pnl": _maybe_float(rec.get("pnl")),
+                        "symbol": payload.get("symbol", ""),
+                        "side": (payload.get("side") or "buy").lower(),
+                        "qty": float(payload.get("qty") or 0),
+                        "avg_fill_price": _maybe_float(payload.get("avg_fill_price")),
+                        "status": payload.get("status", "unknown"),
+                        "pnl": _maybe_float(payload.get("realized_pnl") or payload.get("pnl")),
                         "payload": json.dumps(rec, default=str),
                         "occurred_at": _parse_ts(rec),
                     },
                 )
 
         _refresh_bot_state(db)
+
+
+def _as_symbol_list(payload: dict) -> list[str]:
+    """Normalise to a list[str] of symbols. Engine sometimes uses
+    `symbols` (plural list) for halts/reconciles, sometimes `symbol`
+    (singular) for per-symbol diagnostics."""
+    if "symbols" in payload and isinstance(payload["symbols"], list):
+        return [str(s) for s in payload["symbols"]]
+    if "symbol" in payload and payload["symbol"]:
+        return [str(payload["symbol"])]
+    return []
 
 
 def _refresh_bot_state(db) -> None:
