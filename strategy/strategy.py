@@ -852,21 +852,55 @@ class Strategy:
 
     # ---- market data helper (broker-only, no cache) ------------------
 
+    # Calendar:trading ratio. US regular hours are ~6.5h/day × 5 days/week.
+    # That is ~32.5 trading hours per ~168 calendar hours = 5.17×. We use
+    # 8 to leave ~50% margin for federal holidays and any half-days. With
+    # min_bars_trend_tf=210 hourly bars, this asks for ~70 calendar days,
+    # which fills comfortably.
+    _CAL_BUFFER = 8
+
     def _fetch_bar_frame(self, symbol: str, now: datetime) -> BarFrame | None:
         sp = self.config.strategy
         entry_tf = _TF_NAME_TO_ENUM[sp.entry_tf]
         confirm_tf = _TF_NAME_TO_ENUM[sp.confirm_tf]
         trend_tf = _TF_NAME_TO_ENUM[sp.trend_tf]
         try:
-            # Ask for a window wide enough to fill the min_bars_*_tf requirement.
-            entry_start = now - timedelta(minutes=_TF_NAME_TO_MINUTES[sp.entry_tf] * sp.min_bars_entry_tf * 2)
-            confirm_start = now - timedelta(minutes=_TF_NAME_TO_MINUTES[sp.confirm_tf] * sp.min_bars_confirm_tf * 2)
-            trend_start = now - timedelta(minutes=_TF_NAME_TO_MINUTES[sp.trend_tf] * sp.min_bars_trend_tf * 2)
+            # Window has to cover ``min_bars_*_tf`` *trading* bars; multiply
+            # by _CAL_BUFFER to convert from trading minutes to calendar
+            # minutes. The previous ``* 2`` factor under-fetched on every
+            # timeframe — the strategy never reached signal evaluation.
+            entry_start = now - timedelta(
+                minutes=_TF_NAME_TO_MINUTES[sp.entry_tf] * sp.min_bars_entry_tf * self._CAL_BUFFER
+            )
+            confirm_start = now - timedelta(
+                minutes=_TF_NAME_TO_MINUTES[sp.confirm_tf] * sp.min_bars_confirm_tf * self._CAL_BUFFER
+            )
+            trend_start = now - timedelta(
+                minutes=_TF_NAME_TO_MINUTES[sp.trend_tf] * sp.min_bars_trend_tf * self._CAL_BUFFER
+            )
             entry_bars = self.broker.get_bars(symbol, entry_tf, start=entry_start, end=now)
             confirm_bars = self.broker.get_bars(symbol, confirm_tf, start=confirm_start, end=now)
             trend_bars = self.broker.get_bars(symbol, trend_tf, start=trend_start, end=now)
         except StrategyError:
             return None
+        # Temporary diagnostic — proves the fetch returned enough bars in
+        # production. Throttled per-symbol so we see one line every 5 min
+        # per symbol, not 30/min. Remove once we have a few sessions of
+        # confirmation that bar counts comfortably exceed the thresholds.
+        self._emit_diagnostic(
+            now,
+            symbol,
+            "bars_fetched",
+            f"entry={len(entry_bars)} confirm={len(confirm_bars)} trend={len(trend_bars)}",
+            extra={
+                "entry": len(entry_bars),
+                "confirm": len(confirm_bars),
+                "trend": len(trend_bars),
+                "min_entry": sp.min_bars_entry_tf,
+                "min_confirm": sp.min_bars_confirm_tf,
+                "min_trend": sp.min_bars_trend_tf,
+            },
+        )
         if not entry_bars or not confirm_bars or not trend_bars:
             return None
         return BarFrame(
