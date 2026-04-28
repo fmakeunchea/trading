@@ -11,6 +11,7 @@ def test_status_returns_shape(client):
         "broker_connected": True,
         "open_positions_count": 2,
         "incidents_today": 0,
+        "diagnostics_today": 47,
     }
     r = client.get("/status")
     assert r.status_code == 200
@@ -18,5 +19,7 @@ def test_status_returns_shape(client):
     assert body["running"] is True
     assert body["mode"] == "paper"
     assert body["open_positions_count"] == 2
+    assert body["incidents_today"] == 0
+    assert body["diagnostics_today"] == 47
     # heartbeat_fresh is computed live from filesystem; absent file => False
     assert body["heartbeat_fresh"] is False

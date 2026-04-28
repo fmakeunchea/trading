@@ -17,7 +17,7 @@ def status(db: Session = Depends(get_db)) -> BotStatus:
             """
             SELECT running, mode, kill_switch_engaged, heartbeat_at,
                    reconcile_ok, broker_connected, open_positions_count,
-                   incidents_today
+                   incidents_today, diagnostics_today
             FROM bot_state WHERE id = 1
             """
         )
@@ -32,6 +32,7 @@ def status(db: Session = Depends(get_db)) -> BotStatus:
         broker_connected=row["broker_connected"],
         open_positions_count=int(row["open_positions_count"]),
         incidents_today=int(row["incidents_today"]),
+        diagnostics_today=int(row["diagnostics_today"] or 0),
     )
 
 

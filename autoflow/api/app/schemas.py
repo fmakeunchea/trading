@@ -85,7 +85,8 @@ class BotStatus(BaseModel):
     reconcile_ok: bool | None
     broker_connected: bool | None
     open_positions_count: int
-    incidents_today: int
+    incidents_today: int       # critical only (DIAGNOSTIC excluded)
+    diagnostics_today: int = 0 # observability records (no_signal, bars_fetched, …)
 
 
 class SmokeTestResult(BaseModel):

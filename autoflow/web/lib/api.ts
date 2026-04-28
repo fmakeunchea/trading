@@ -71,8 +71,11 @@ export interface BotStatus {
   reconcile_ok: boolean | null;
   broker_connected: boolean | null;
   open_positions_count: number;
-  incidents_today: number;
+  incidents_today: number;     // critical only
+  diagnostics_today: number;   // observability records
 }
+
+export type IncidentCategory = "critical" | "diagnostic" | "all";
 
 export interface SmokeTestResult {
   id: number;
@@ -93,7 +96,8 @@ export const api = {
   status: () => http<BotStatus>("/status"),
   positions: () => http<Position[]>("/positions"),
   orders: (limit = 50) => http<Trade[]>(`/orders?limit=${limit}`),
-  incidents: (limit = 100) => http<Incident[]>(`/incidents?limit=${limit}`),
+  incidents: (limit = 100, category: IncidentCategory = "critical") =>
+    http<Incident[]>(`/incidents?limit=${limit}&category=${category}`),
   strategies: () => http<Strategy[]>("/strategies"),
   updateStrategy: (
     id: number,

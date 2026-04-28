@@ -155,6 +155,11 @@ export default async function DashboardPage() {
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
               <Row label="Incidents today" value={String(status?.incidents_today ?? 0)} />
+              <Row
+                label="Diagnostics today"
+                value={String(status?.diagnostics_today ?? 0)}
+                muted
+              />
               <Row label="Open positions" value={String(status?.open_positions_count ?? 0)} />
               <Row label="Broker last contact" value={timeAgo(status?.heartbeat_at ?? null)} />
             </CardContent>
@@ -165,11 +170,23 @@ export default async function DashboardPage() {
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({
+  label,
+  value,
+  muted = false,
+}: {
+  label: string;
+  value: string;
+  muted?: boolean;
+}) {
   return (
     <div className="flex items-center justify-between">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="tabular-nums">{value}</span>
+      <span className={muted ? "text-xs text-muted-foreground/70" : "text-muted-foreground"}>
+        {label}
+      </span>
+      <span className={muted ? "tabular-nums text-xs text-muted-foreground/70" : "tabular-nums"}>
+        {value}
+      </span>
     </div>
   );
 }

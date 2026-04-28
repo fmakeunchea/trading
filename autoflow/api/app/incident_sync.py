@@ -126,8 +126,22 @@ def _as_symbol_list(payload: dict) -> list[str]:
 def _refresh_bot_state(db) -> None:
     hb = engine_io.heartbeat()
     today = date.today()
+    # Critical = anything that isn't an observability diagnostic. Diagnostic
+    # records are emitted by the engine for transparency on quiet days
+    # (bars_fetched, no_signal, risk_denied, etc.) and must not count
+    # toward the operator-facing "incidents today" badge.
     incidents_today = db.execute(
-        text("SELECT COUNT(*) FROM incidents WHERE occurred_at::date = :d"),
+        text(
+            "SELECT COUNT(*) FROM incidents "
+            "WHERE occurred_at::date = :d AND kind != 'DIAGNOSTIC'"
+        ),
+        {"d": today},
+    ).scalar_one()
+    diagnostics_today = db.execute(
+        text(
+            "SELECT COUNT(*) FROM incidents "
+            "WHERE occurred_at::date = :d AND kind = 'DIAGNOSTIC'"
+        ),
         {"d": today},
     ).scalar_one()
     positions = engine_io.open_positions()
@@ -149,6 +163,7 @@ def _refresh_bot_state(db) -> None:
               open_positions_count = :npos,
               open_positions = CAST(:positions AS JSONB),
               incidents_today = :incidents_today,
+              diagnostics_today = :diagnostics_today,
               updated_at = now()
             WHERE id = 1
             """
@@ -164,6 +179,7 @@ def _refresh_bot_state(db) -> None:
             "npos": len(positions),
             "positions": json.dumps(positions),
             "incidents_today": incidents_today,
+            "diagnostics_today": diagnostics_today,
         },
     )
 
