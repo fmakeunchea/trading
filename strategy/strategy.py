@@ -883,24 +883,6 @@ class Strategy:
             trend_bars = self.broker.get_bars(symbol, trend_tf, start=trend_start, end=now)
         except StrategyError:
             return None
-        # Temporary diagnostic — proves the fetch returned enough bars in
-        # production. Throttled per-symbol so we see one line every 5 min
-        # per symbol, not 30/min. Remove once we have a few sessions of
-        # confirmation that bar counts comfortably exceed the thresholds.
-        self._emit_diagnostic(
-            now,
-            symbol,
-            "bars_fetched",
-            f"entry={len(entry_bars)} confirm={len(confirm_bars)} trend={len(trend_bars)}",
-            extra={
-                "entry": len(entry_bars),
-                "confirm": len(confirm_bars),
-                "trend": len(trend_bars),
-                "min_entry": sp.min_bars_entry_tf,
-                "min_confirm": sp.min_bars_confirm_tf,
-                "min_trend": sp.min_bars_trend_tf,
-            },
-        )
         if not entry_bars or not confirm_bars or not trend_bars:
             return None
         return BarFrame(
