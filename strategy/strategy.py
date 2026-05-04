@@ -853,11 +853,16 @@ class Strategy:
     # ---- market data helper (broker-only, no cache) ------------------
 
     # Calendar:trading ratio. US regular hours are ~6.5h/day × 5 days/week.
-    # That is ~32.5 trading hours per ~168 calendar hours = 5.17×. We use
-    # 8 to leave ~50% margin for federal holidays and any half-days. With
-    # min_bars_trend_tf=210 hourly bars, this asks for ~70 calendar days,
-    # which fills comfortably.
-    _CAL_BUFFER = 8
+    # That is ~32.5 trading hours per ~168 calendar hours = 5.17×.
+    #
+    # _CAL_BUFFER=8 was insufficient on Monday-morning sessions because
+    # the buffer's weekend gap consumed most of the lookback window. With
+    # 5-min entry bars at min_bars=100, we need ~1.3 trading days back —
+    # which on Monday open is Thursday last week. _CAL_BUFFER=8 only
+    # reached Friday evening, yielding ~20 entry bars vs 100 required.
+    # Bumped to 16 (~5.5 calendar days = Tue→Mon worst case = ~3 trading
+    # days banked, comfortably above all three thresholds).
+    _CAL_BUFFER = 16
 
     def _fetch_bar_frame(self, symbol: str, now: datetime) -> BarFrame | None:
         sp = self.config.strategy
