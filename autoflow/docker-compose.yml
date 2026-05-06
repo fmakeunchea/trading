@@ -62,6 +62,10 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
       # Server-side (SSR) calls go through the docker network
       API_URL_INTERNAL: http://api:8000
+      # Bind Next.js standalone to all interfaces, not just the docker-assigned
+      # hostname IP — needed when web is on multiple networks (e.g. Traefik
+      # overlay), otherwise the proxy hits a dead interface and returns 502.
+      HOSTNAME: 0.0.0.0
     ports:
       - "127.0.0.1:3000:3000"
 
