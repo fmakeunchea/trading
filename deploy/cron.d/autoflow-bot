@@ -1,0 +1,18 @@
+# Auto start/stop the trading bot around the NYSE session (UTC).
+# Engine session_window in config: 13:35-19:45 UTC. Update this file when DST
+# ends (Nov) so it shifts an hour to match the engine config.
+# Holiday handling: cron fires unconditionally — engine's session_window gate
+# inside run_strategy.py prevents trades on closed days, so this is harmless.
+# API isn't bound on the host (Traefik overlay strips host ports), so we hit
+# it via the docker network using a one-shot curl container.
+#
+# Install on VPS:
+#   sudo install -m 644 -o root -g root deploy/cron.d/autoflow-bot /etc/cron.d/autoflow-bot
+SHELL=/bin/bash
+MAILTO=""
+
+# 13:30 UTC, Mon-Fri — start (5 min before engine window opens)
+30 13 * * 1-5 root /bin/bash -c 'echo "[$(date -u +%FT%TZ)] start-bot:"; docker run --rm --network root_default curlimages/curl:latest -fsS -m 10 -X POST http://autoflow-api-1:8000/start-bot; echo' >> /var/log/autoflow-bot.log 2>&1
+
+# 19:50 UTC, Mon-Fri — stop (5 min after engine window closes)
+50 19 * * 1-5 root /bin/bash -c 'echo "[$(date -u +%FT%TZ)] stop-bot:"; docker run --rm --network root_default curlimages/curl:latest -fsS -m 10 -X POST http://autoflow-api-1:8000/stop-bot; echo' >> /var/log/autoflow-bot.log 2>&1
