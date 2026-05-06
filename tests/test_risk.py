@@ -104,7 +104,7 @@ def _quote(bid: str = "199.98", ask: str = "200.02") -> Quote:
 def _req(
     *,
     expected_move_bps: Decimal = Decimal("50"),
-    latest_bar_ts: datetime | None = None,
+    latest_bar_close_ts: datetime | None = None,
     reconcile_clean: bool = True,
     kill_switch_present: bool = False,
     quote: Quote | None = None,
@@ -113,7 +113,7 @@ def _req(
     return EntryRequest(
         signal=_signal(expected_move_bps),
         quote=quote or _quote(),
-        latest_bar_ts=latest_bar_ts or now_ts - timedelta(seconds=5),
+        latest_bar_close_ts=latest_bar_close_ts or now_ts - timedelta(seconds=5),
         expected_move_bps=expected_move_bps,
         reconcile_clean=reconcile_clean,
         kill_switch_present=kill_switch_present,
@@ -164,11 +164,69 @@ def test_blackout_denies(cfg, state, account) -> None:
     assert not d.allowed and d.reason == "session_blackout"
 
 
-def test_stale_data_denies(cfg, state, account, now) -> None:
-    # stale_data_max_age_s = 30 in fixture; make it 60 seconds old.
-    stale_ts = now - timedelta(seconds=60)
-    d = evaluate_entry(_req(latest_bar_ts=stale_ts), state, cfg, account, now)
-    assert not d.allowed and d.reason == "stale_data"
+def test_stale_bar_denies(cfg, state, account, now) -> None:
+    # entry_tf=5Min (300s) + stale_bar_grace_s=30 ⇒ threshold = 330s.
+    # Bar close 400s ago is past threshold ⇒ deny stale_bar.
+    stale_close = now - timedelta(seconds=400)
+    d = evaluate_entry(_req(latest_bar_close_ts=stale_close), state, cfg, account, now)
+    assert not d.allowed and d.reason == "stale_bar"
+
+
+def test_5min_bar_open_5min_ago_passes(cfg, state, account, now) -> None:
+    """A 5Min bar whose *open* was 5 minutes ago has just closed — fresh.
+
+    Regression for the bug where the gate compared `now - bar.open` against
+    a 30s threshold, which structurally could never pass for 5-min bars.
+    """
+    bar_open = now - timedelta(minutes=5)
+    bar_close = bar_open + timedelta(minutes=5)   # == now
+    d = evaluate_entry(_req(latest_bar_close_ts=bar_close), state, cfg, account, now)
+    assert d.allowed, d.reason
+
+
+def test_5min_bar_close_just_past_threshold_denies(cfg, state, account, now) -> None:
+    """Bar close 331s ago is just past the 330s threshold ⇒ stale_bar."""
+    bar_close = now - timedelta(seconds=331)
+    d = evaluate_entry(_req(latest_bar_close_ts=bar_close), state, cfg, account, now)
+    assert not d.allowed and d.reason == "stale_bar"
+
+
+def test_quote_threshold_independent_of_bar_grace(cfg) -> None:
+    """The quote threshold (used at the exit-management path) is the
+    `stale_data_max_age_s` field and must remain decoupled from
+    `stale_bar_grace_s`. The exit path is at strategy.manage_open_trades.
+    """
+    from strategy.time_utils import is_stale
+    assert cfg.risk.stale_data_max_age_s == 30
+    assert cfg.risk.stale_bar_grace_s == 30
+    qref = datetime(2026, 4, 23, 14, 30, tzinfo=UTC)
+    # 31s old ⇒ stale at the quote threshold (would skip an exit eval).
+    assert is_stale(qref - timedelta(seconds=31), qref,
+                    cfg.risk.stale_data_max_age_s) is True
+    # 29s old ⇒ fresh at the quote threshold.
+    assert is_stale(qref - timedelta(seconds=29), qref,
+                    cfg.risk.stale_data_max_age_s) is False
+
+
+def test_bar_close_timezone_handling(cfg, state, account, now) -> None:
+    """Contract for the bar-staleness gate: tz-aware datetimes are
+    normalised to UTC; naive datetimes are rejected.
+
+    * Aware UTC → works.
+    * Aware non-UTC (same instant, expressed in another zone) → identical.
+    * Naive → raises (we never guess the caller's zone).
+    """
+    from zoneinfo import ZoneInfo
+    aware_utc = now - timedelta(seconds=60)                    # well within 330s
+    aware_ny = aware_utc.astimezone(ZoneInfo("America/New_York"))  # same instant
+    d_utc = evaluate_entry(_req(latest_bar_close_ts=aware_utc), state, cfg, account, now)
+    d_ny = evaluate_entry(_req(latest_bar_close_ts=aware_ny), state, cfg, account, now)
+    assert d_utc.allowed and d_ny.allowed
+    assert d_utc.reason == d_ny.reason
+
+    naive = aware_utc.replace(tzinfo=None)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        evaluate_entry(_req(latest_bar_close_ts=naive), state, cfg, account, now)
 
 
 def test_halt_active_denies(cfg, state, account, now) -> None:
@@ -222,7 +280,7 @@ def test_cooldown_denies_then_allows(cfg, state, account, now) -> None:
     # Advance clock past the window. Keep the bar fresh relative to `later`.
     later = now + timedelta(seconds=200)   # 1000s after the loss
     fresh_bar = later - timedelta(seconds=5)
-    d2 = evaluate_entry(_req(latest_bar_ts=fresh_bar), state, cfg, account, later)
+    d2 = evaluate_entry(_req(latest_bar_close_ts=fresh_bar), state, cfg, account, later)
     assert d2.allowed, d2.reason
 
 
@@ -267,7 +325,7 @@ def test_size_below_minimum_denies(cfg, state, account, now) -> None:
     req = EntryRequest(
         signal=expensive_sig,
         quote=_quote(bid="49999", ask="50001"),
-        latest_bar_ts=now - timedelta(seconds=5),
+        latest_bar_close_ts=now - timedelta(seconds=5),
         expected_move_bps=Decimal("50"),
         reconcile_clean=True,
         kill_switch_present=False,

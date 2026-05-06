@@ -17,6 +17,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
 
+TF_NAME_TO_MINUTES: dict[str, int] = {
+    "5Min": 5,
+    "15Min": 15,
+    "1Hour": 60,
+}
+
+
 def now_utc() -> datetime:
     """Single wall-clock source for the package.
 

@@ -41,7 +41,7 @@ from strategy.dto import (
     Signal,
 )
 from strategy.state import StrategyState
-from strategy.time_utils import SessionClock, is_stale
+from strategy.time_utils import SessionClock, TF_NAME_TO_MINUTES, is_stale
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,11 @@ class EntryRequest:
 
     signal: Signal
     quote: Quote                       # fresh quote at decision time
-    latest_bar_ts: datetime            # freshness of the market data
+    # Bar-close timestamp of the latest entry-tf bar. Alpaca returns
+    # bar.ts as the bar's *open*; the orchestrator computes ts + period
+    # so the freshness gate compares against an honest "data current as
+    # of" instant rather than always trailing by a full bar period.
+    latest_bar_close_ts: datetime
     expected_move_bps: Decimal         # signal's estimated move
     reconcile_clean: bool              # from strategy.reconcile output
     kill_switch_present: bool          # from a filesystem check in orchestrator
@@ -107,9 +111,15 @@ def evaluate_entry(
     if session_clock.in_blackout(now):
         return _deny("session_blackout")
 
-    # 4. Freshness
-    if is_stale(request.latest_bar_ts, now, config.risk.stale_data_max_age_s):
-        return _deny("stale_data")
+    # 4. Freshness — bar staleness only. Alpaca's bar.ts is the bar
+    # *open*; the orchestrator passes bar-close (open + period) so this
+    # threshold is "how long since the latest bar closed" rather than
+    # "how long since the latest bar opened" (which is bounded below by
+    # the bar period itself, making a 30s gate structurally unreachable).
+    bar_period_s = TF_NAME_TO_MINUTES[config.strategy.entry_tf] * 60
+    bar_max_age_s = bar_period_s + config.risk.stale_bar_grace_s
+    if is_stale(request.latest_bar_close_ts, now, bar_max_age_s):
+        return _deny("stale_bar")
 
     # 5. Halts of any kind
     if state.any_halt_active():

@@ -110,7 +110,14 @@ class RiskConfig:
     daily_loss_cap_pct: Decimal
     max_concurrent_positions: int
     spread_filter_bps: Decimal
+    # Quote-staleness threshold (seconds). Used by the exit-management
+    # path that reads live quotes; not used for bar staleness.
     stale_data_max_age_s: int
+    # Bar-staleness *grace* window (seconds) added on top of the entry-
+    # timeframe period. Effective bar threshold = entry_tf_minutes * 60
+    # + stale_bar_grace_s. Kept as a grace rather than an absolute so it
+    # auto-adjusts if entry_tf changes.
+    stale_bar_grace_s: int
     session_start_utc: time
     session_end_utc: time
     loss_cooldown_s: int
@@ -299,6 +306,7 @@ def _load_risk(d: Mapping[str, Any]) -> RiskConfig:
         max_concurrent_positions=int(_req_int(d, "max_concurrent_positions")),
         spread_filter_bps=_dec(d, "spread_filter_bps"),
         stale_data_max_age_s=int(_req_int(d, "stale_data_max_age_s")),
+        stale_bar_grace_s=int(_req_int(d, "stale_bar_grace_s")),
         session_start_utc=parse_hhmm_utc(_req_str(d, "session_start_utc")),
         session_end_utc=parse_hhmm_utc(_req_str(d, "session_end_utc")),
         loss_cooldown_s=int(_req_int(d, "loss_cooldown_s")),
@@ -408,6 +416,8 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("spread_filter_bps must be positive")
     if r.stale_data_max_age_s <= 0:
         raise ConfigError("stale_data_max_age_s must be positive")
+    if r.stale_bar_grace_s <= 0:
+        raise ConfigError("stale_bar_grace_s must be positive")
     if r.max_concurrent_positions <= 0:
         raise ConfigError("max_concurrent_positions must be positive")
     if r.loss_cooldown_s < 0:

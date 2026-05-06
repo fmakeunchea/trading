@@ -421,10 +421,11 @@ def test_kill_switch_does_not_block_exits(cfg_and_paths, broker) -> None:
 
 
 def test_stale_bars_block_entry(cfg_and_paths, broker) -> None:
-    """Stale data gate fires against the latest bar timestamp.
+    """Stale data gate fires against the latest bar close.
 
-    We replace the 5m series with one whose final bar is 10 minutes before
-    NOW — well past the 30s stale threshold in the fixture.
+    Threshold = entry_tf (5min=300s) + stale_bar_grace_s (30s) = 330s.
+    Final bar opens 20 minutes before NOW → closes 15 minutes before NOW
+    → age 900s, comfortably past the 330s threshold.
     """
     s = _strategy(cfg_and_paths, broker)
     s.recover(NOW)
@@ -432,7 +433,7 @@ def test_stale_bars_block_entry(cfg_and_paths, broker) -> None:
         bars = _synth_trend(
             sym, 120,
             start_price=Decimal("180"), step=Decimal("0.10"),
-            start_ts=NOW - timedelta(minutes=5 * 120 + 10),
+            start_ts=NOW - timedelta(minutes=5 * 120 + 20),
             tf_minutes=5,
             force_breakout=True,
         )
@@ -441,7 +442,7 @@ def test_stale_bars_block_entry(cfg_and_paths, broker) -> None:
     assert not rep.entries_submitted
     assert rep.denies
     for _, reason in rep.denies:
-        assert reason == "stale_data", reason
+        assert reason == "stale_bar", reason
 
 
 # ---------------------------------------------------------------------------

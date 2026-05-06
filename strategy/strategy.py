@@ -67,7 +67,13 @@ from strategy.reconcile import reconcile
 from strategy.risk import EntryRequest, evaluate_entry
 from strategy.signal import BarFrame, evaluate_signal
 from strategy.state import StateStore, StrategyState
-from strategy.time_utils import SessionClock, ensure_utc, is_stale, today_utc
+from strategy.time_utils import (
+    SessionClock,
+    TF_NAME_TO_MINUTES,
+    ensure_utc,
+    is_stale,
+    today_utc,
+)
 from strategy.trade_log import TradeLog
 
 
@@ -111,13 +117,6 @@ _TF_NAME_TO_ENUM: dict[str, BarTimeframe] = {
     "5Min": BarTimeframe.M5,
     "15Min": BarTimeframe.M15,
     "1Hour": BarTimeframe.H1,
-}
-
-
-_TF_NAME_TO_MINUTES: dict[str, int] = {
-    "5Min": 5,
-    "15Min": 15,
-    "1Hour": 60,
 }
 
 
@@ -582,7 +581,7 @@ class Strategy:
         if ref >= trade.target_price:
             return "target_hit"
         # Time stop: compare held duration against max_hold_bars * entry_tf minutes.
-        minutes_per_bar = _TF_NAME_TO_MINUTES[self.config.strategy.entry_tf]
+        minutes_per_bar = TF_NAME_TO_MINUTES[self.config.strategy.entry_tf]
         max_hold = timedelta(minutes=minutes_per_bar * self.config.strategy.max_hold_bars)
         if now - trade.entry_ts >= max_hold:
             return "time_stop"
@@ -694,11 +693,15 @@ class Strategy:
             self._emit_diagnostic(now, symbol, "no_signal", "quote_fetch_failed")
             return None
         # --- risk gate -----------------------------------------------
-        latest_bar_ts = frame.entry_bars[-1].ts
+        # Alpaca's bar.ts is the bar *open* time, so the freshness check
+        # gets the bar close: open + entry_tf_minutes.
+        latest_bar_close_ts = frame.entry_bars[-1].ts + timedelta(
+            minutes=TF_NAME_TO_MINUTES[self.config.strategy.entry_tf]
+        )
         request = EntryRequest(
             signal=sig,
             quote=quote,
-            latest_bar_ts=latest_bar_ts,
+            latest_bar_close_ts=latest_bar_close_ts,
             expected_move_bps=sig.expected_move_bps,
             reconcile_clean=recon_clean,
             kill_switch_present=kill_switch_present,
@@ -875,13 +878,13 @@ class Strategy:
             # minutes. The previous ``* 2`` factor under-fetched on every
             # timeframe — the strategy never reached signal evaluation.
             entry_start = now - timedelta(
-                minutes=_TF_NAME_TO_MINUTES[sp.entry_tf] * sp.min_bars_entry_tf * self._CAL_BUFFER
+                minutes=TF_NAME_TO_MINUTES[sp.entry_tf] * sp.min_bars_entry_tf * self._CAL_BUFFER
             )
             confirm_start = now - timedelta(
-                minutes=_TF_NAME_TO_MINUTES[sp.confirm_tf] * sp.min_bars_confirm_tf * self._CAL_BUFFER
+                minutes=TF_NAME_TO_MINUTES[sp.confirm_tf] * sp.min_bars_confirm_tf * self._CAL_BUFFER
             )
             trend_start = now - timedelta(
-                minutes=_TF_NAME_TO_MINUTES[sp.trend_tf] * sp.min_bars_trend_tf * self._CAL_BUFFER
+                minutes=TF_NAME_TO_MINUTES[sp.trend_tf] * sp.min_bars_trend_tf * self._CAL_BUFFER
             )
             entry_bars = self.broker.get_bars(symbol, entry_tf, start=entry_start, end=now)
             confirm_bars = self.broker.get_bars(symbol, confirm_tf, start=confirm_start, end=now)

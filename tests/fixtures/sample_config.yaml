@@ -41,6 +41,7 @@ risk:
   max_concurrent_positions: 3
   spread_filter_bps: 15
   stale_data_max_age_s: 30
+  stale_bar_grace_s: 30
   session_start_utc: "13:35"
   session_end_utc: "19:45"
   loss_cooldown_s: 900
