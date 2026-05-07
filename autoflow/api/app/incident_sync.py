@@ -30,6 +30,56 @@ def _stable_source_id(rec: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+# Engine RESULT records identify the trade by `intent_id`, formatted as
+# "{action}-{SYMBOL}-{ts}" — they don't echo `symbol`/`side` at the top of
+# the payload. The ingestion path therefore parses the id back out. Keep
+# this mapping in sync with strategy.trade_log if new actions get added.
+_ACTION_TO_SIDE: dict[str, str] = {
+    "entry": "buy",
+    "cover": "buy",
+    "close": "sell",
+    "short": "sell",
+    "exit": "sell",
+}
+
+
+def _parse_intent_id(intent_id: str) -> tuple[str, str]:
+    """Split an intent_id into (action, symbol). Returns ('', '') on bad input."""
+    if not intent_id:
+        return "", ""
+    parts = intent_id.split("-", 2)
+    if len(parts) < 2:
+        return "", ""
+    return parts[0].lower(), parts[1]
+
+
+def _extract_symbol(payload: dict) -> str:
+    if payload.get("symbol"):
+        return str(payload["symbol"])
+    _, sym = _parse_intent_id(str(payload.get("intent_id") or ""))
+    return sym
+
+
+def _extract_side(payload: dict) -> str:
+    side = payload.get("side")
+    if side:
+        return str(side).lower()
+    action, _ = _parse_intent_id(str(payload.get("intent_id") or ""))
+    return _ACTION_TO_SIDE.get(action, "buy")
+
+
+def _extract_qty(payload: dict) -> float:
+    for key in ("filled_qty", "qty", "qty_requested"):
+        v = payload.get(key)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _parse_ts(rec: dict) -> datetime:
     ts = rec.get("timestamp") or rec.get("ts") or rec.get("at")
     if not ts:
@@ -98,9 +148,9 @@ def sync_once() -> None:
                     ),
                     {
                         "source_id": source_id,
-                        "symbol": payload.get("symbol", ""),
-                        "side": (payload.get("side") or "buy").lower(),
-                        "qty": float(payload.get("qty") or 0),
+                        "symbol": _extract_symbol(payload),
+                        "side": _extract_side(payload),
+                        "qty": _extract_qty(payload),
                         "avg_fill_price": _maybe_float(payload.get("avg_fill_price")),
                         "status": payload.get("status", "unknown"),
                         "pnl": _maybe_float(payload.get("realized_pnl") or payload.get("pnl")),

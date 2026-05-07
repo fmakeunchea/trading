@@ -110,13 +110,32 @@ def open_positions() -> list[dict]:
 
 
 def last_reconcile_ok() -> bool | None:
-    """Best-effort: the most recent RECONCILE incident's outcome."""
-    for rec in tail_trade_log(limit=500, kinds={"INCIDENT"}):
+    """Best-effort: True iff the most recent reconcile cycle was clean.
+
+    The engine emits a `reconcile_mismatch` INCIDENT only when reconciliation
+    surfaces a problem; on the happy path no record is written. We treat the
+    absence of a recent mismatch — while heartbeat is fresh — as evidence of
+    a clean reconcile. Returns None when we have no signal at all (engine
+    never started or heartbeat stale).
+    """
+    if not heartbeat_fresh():
+        return None
+    horizon_seconds = settings.heartbeat_stale_seconds * 4
+    now = datetime.now(timezone.utc)
+    for rec in tail_trade_log(limit=200, kinds={"INCIDENT"}):
+        ts_str = rec.get("ts")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (now - ts).total_seconds() > horizon_seconds:
+            break  # tail is newest-first; older records can't matter
         payload = rec.get("payload", {}) or {}
-        if rec.get("phase") == "RECONCILE" or payload.get("phase") == "RECONCILE":
-            reason = (payload.get("reason") or "").lower()
-            return "mismatch" not in reason and "orphan" not in reason
-    return None
+        if str(payload.get("kind") or "").lower() == "reconcile_mismatch":
+            return False
+    return True
 
 
 def broker_last_contact() -> datetime | None:
