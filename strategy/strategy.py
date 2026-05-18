@@ -57,6 +57,7 @@ from strategy.dto import (
 )
 from strategy.errors import (
     AuditIntegrityError,
+    OrderOutcomeUnknown,
     PermanentBrokerError,
     ReconcileMismatch,
     StaleDataError,
@@ -64,6 +65,7 @@ from strategy.errors import (
     TransientBrokerError,
 )
 from strategy.reconcile import reconcile
+from strategy.recovery import OutcomeKind, recover_pending_submissions
 from strategy.risk import EntryRequest, evaluate_entry
 from strategy.signal import BarFrame, evaluate_signal
 from strategy.state import StateStore, StrategyState
@@ -236,6 +238,12 @@ class Strategy:
             else:
                 self._state.trading_day = today
 
+        # Recover any submitted-but-unconfirmed entry BEFORE reconcile so a
+        # restart mid-incident folds the real position into open_trades
+        # first — otherwise the existing orphan-protective halt below would
+        # trip on a position we can actually account for.
+        self._recover_pending_submissions(now)
+
         try:
             account = self.broker.get_account_snapshot()
             positions = self.broker.get_positions()
@@ -340,6 +348,14 @@ class Strategy:
         report = TickReport(ts=now, reconcile_report=ReconcileReport())
 
         self._maybe_rollover(now)
+
+        # --- recover lost submissions FIRST ---------------------------
+        # Strictly before reconcile/entry/orphan-checks: a recovered
+        # position must be in open_trades when reconcile runs, or it
+        # would be flagged as an orphan-protective mismatch (the exact
+        # 2026-05-15 failure). An escalated halt here flows naturally
+        # into the sticky-halt branch below (exits managed, no entries).
+        self._recover_pending_submissions(now)
 
         # --- reconcile first ------------------------------------------
         try:
@@ -752,28 +768,50 @@ class Strategy:
             ts=now,
         )
         coid = intent.client_order_id()
-        self.trade_log.append_intent(
-            {
-                "intent_id": intent_id,
-                "client_order_id": coid,
-                "symbol": symbol,
-                "side": OrderSide.BUY.value,
-                "qty_requested": decision.qty,
-                "limit_price": str(decision.limit_price),
-                "stop_price": str(decision.stop_price),
-                "disaster_stop_price": str(decision.disaster_stop_price),
-                "reason": sig.reason,
-                "equity_snapshot": str(self._state.last_reconciled_equity),
-                "peak_equity": str(self._state.peak_equity),
-                "drawdown_pct": str(decision.drawdown_pct),
-                "throttle_multiplier": str(decision.throttle),
-                "spread_bps": str(quote.spread_bps()),
-                "result": "submitting",
-            }
-        )
+        # target_price is logged on the INTENT so the recovery path can
+        # reconstruct the OpenTrade WITHOUT recomputing it (no parallel
+        # accounting). It is the exact value _finalize_entry uses.
+        target_price = (
+            decision.limit_price
+            + (self.config.strategy.atr_target_mult * sig.atr)
+        ).quantize(Decimal("0.01"))
+        _intent_record = {
+            "intent_id": intent_id,
+            "client_order_id": coid,
+            "symbol": symbol,
+            "side": OrderSide.BUY.value,
+            "qty_requested": decision.qty,
+            "limit_price": str(decision.limit_price),
+            "stop_price": str(decision.stop_price),
+            "disaster_stop_price": str(decision.disaster_stop_price),
+            "target_price": str(target_price),
+            "reason": sig.reason,
+            "equity_snapshot": str(self._state.last_reconciled_equity),
+            "peak_equity": str(self._state.peak_equity),
+            "drawdown_pct": str(decision.drawdown_pct),
+            "throttle_multiplier": str(decision.throttle),
+            "spread_bps": str(quote.spread_bps()),
+            "result": "submitting",
+        }
+        self.trade_log.append_intent(_intent_record)
         try:
             submitted = self.broker.submit_entry_with_protection(intent)
             terminal = self.broker.poll_terminal(coid)
+        except OrderOutcomeUnknown as exc:
+            # The order may be live at the broker — its terminal state is
+            # simply not known yet (a resting limit's fill latency can far
+            # exceed the poll window). This is NOT a failure: do NOT write a
+            # terminal RESULT and do NOT touch open_trades. Persist an
+            # intent-progress marker so _recover_pending_submissions resolves
+            # it by COID on a later tick (idempotent, broker-truth driven).
+            self.trade_log.append_intent(
+                {**_intent_record, "result": "submitted_unconfirmed",
+                 "unconfirmed_reason": str(exc)}
+            )
+            log.warning(
+                "entry %s outcome unknown; deferred to recovery: %s", symbol, exc
+            )
+            return decision
         except StrategyError as exc:
             self.trade_log.append_result(
                 {
@@ -807,26 +845,64 @@ class Strategy:
         submitted_stop_child: BrokerOrder | None,
         now: datetime,
     ) -> None:
+        """Normal-path entry finalisation. Thin wrapper that resolves the
+        derived values (target/stop) and delegates to the single canonical
+        writer :meth:`_finalize_entry`, which the recovery path also uses —
+        so there is exactly one place that writes an entry RESULT +
+        reconstructs open_trades (no parallel accounting)."""
+        target_price = (
+            intent.limit_price
+            + (self.config.strategy.atr_target_mult * intent.atr)
+        ).quantize(Decimal("0.01"))
+        self._finalize_entry(
+            intent_id=intent.intent_id,
+            parent_coid=intent.client_order_id(),
+            symbol=intent.symbol,
+            limit_price=intent.limit_price,
+            stop_price=decision.stop_price or intent.disaster_stop_price,
+            disaster_stop_price=intent.disaster_stop_price,
+            target_price=target_price,
+            terminal=terminal,
+            submitted_stop_child=submitted_stop_child,
+            now=now,
+        )
+
+    def _finalize_entry(
+        self,
+        *,
+        intent_id: str,
+        parent_coid: str,
+        symbol: str,
+        limit_price: Decimal,
+        stop_price: Decimal,
+        disaster_stop_price: Decimal,
+        target_price: Decimal,
+        terminal: BrokerOrder,
+        submitted_stop_child: BrokerOrder | None,
+        now: datetime,
+    ) -> None:
+        """THE canonical entry writer. Appends the terminal RESULT and, on
+        a non-zero fill, reconstructs open_trades. Used by both the normal
+        submit path and the recovery adapter so their audit + state output
+        are byte-for-byte identical. Caller guarantees this runs at most
+        once per intent_id (normal path: single call; recovery: only for
+        intents with no prior RESULT — RESULT-freeze prevents re-entry)."""
         filled_qty = terminal.filled_qty
-        avg_price = terminal.avg_fill_price or intent.limit_price
-        target_price = (intent.limit_price + (self.config.strategy.atr_target_mult * intent.atr)).quantize(Decimal("0.01"))
+        avg_price = terminal.avg_fill_price or limit_price
+        child_coid = submitted_stop_child.client_order_id if submitted_stop_child else None
+        child_bid = submitted_stop_child.broker_order_id if submitted_stop_child else None
+        child_status = submitted_stop_child.status.value if submitted_stop_child else None
         self.trade_log.append_result(
             {
-                "intent_id": intent.intent_id,
-                "client_order_id": intent.client_order_id(),
+                "intent_id": intent_id,
+                "client_order_id": parent_coid,
                 "broker_order_id": terminal.broker_order_id,
                 "status": terminal.status.value,
                 "filled_qty": filled_qty,
                 "avg_fill_price": str(avg_price),
-                "protective_child_client_order_id": (
-                    submitted_stop_child.client_order_id if submitted_stop_child else None
-                ),
-                "protective_child_broker_id": (
-                    submitted_stop_child.broker_order_id if submitted_stop_child else None
-                ),
-                "protective_child_status": (
-                    submitted_stop_child.status.value if submitted_stop_child else None
-                ),
+                "protective_child_client_order_id": child_coid,
+                "protective_child_broker_id": child_bid,
+                "protective_child_status": child_status,
             }
         )
         if filled_qty <= 0:
@@ -834,24 +910,81 @@ class Strategy:
             return
         # Partial or full fill: record the actual qty. Reconcile will
         # verify the OTO child sizes correctly.
-        self._state.open_trades[intent.symbol] = OpenTrade(
-            symbol=intent.symbol,
+        self._state.open_trades[symbol] = OpenTrade(
+            symbol=symbol,
             qty=filled_qty,
             entry_price=avg_price,
             entry_ts=now,
-            stop_price=decision.stop_price or intent.disaster_stop_price,
-            disaster_stop_price=intent.disaster_stop_price,
+            stop_price=stop_price,
+            disaster_stop_price=disaster_stop_price,
             target_price=target_price,
-            intent_id=intent.intent_id,
-            parent_client_order_id=intent.client_order_id(),
-            protective_child_client_order_id=(
-                submitted_stop_child.client_order_id if submitted_stop_child else None
-            ),
-            protective_child_broker_id=(
-                submitted_stop_child.broker_order_id if submitted_stop_child else None
-            ),
+            intent_id=intent_id,
+            parent_client_order_id=parent_coid,
+            protective_child_client_order_id=child_coid,
+            protective_child_broker_id=child_bid,
             last_seen_broker_qty=filled_qty,
         )
+
+    # ---- submitted-but-unconfirmed recovery --------------------------
+
+    def _recover_pending_submissions(self, now: datetime) -> bool:
+        """Resolve any in-flight submission whose terminal outcome we never
+        recorded (the 2026-05-15 lost-fill class). MUST run before reconcile
+        and before entry evaluation so a recovered position is in
+        open_trades when reconcile computes orphans.
+
+        Pure decisions are made by :mod:`strategy.recovery`; this adapter
+        only *applies* the returned instructions, reusing the canonical
+        writers (no parallel accounting). Returns True iff a sticky halt
+        was escalated this call.
+        """
+        records = list(self.trade_log.read_all())
+        session_start = datetime.combine(
+            today_utc(now), self._session_clock.session_start,
+            tzinfo=timezone.utc,
+        )
+        outcomes = recover_pending_submissions(
+            records, self.broker, now, session_start=session_start
+        )
+        halted = False
+        for o in outcomes:
+            if o.kind is OutcomeKind.RESOLVED:
+                p = o.intent_payload
+                self._finalize_entry(
+                    intent_id=o.intent_id,
+                    parent_coid=o.client_order_id,
+                    symbol=p["symbol"],
+                    limit_price=Decimal(str(p["limit_price"])),
+                    stop_price=Decimal(str(p.get("stop_price")
+                                           or p["disaster_stop_price"])),
+                    disaster_stop_price=Decimal(str(p["disaster_stop_price"])),
+                    target_price=Decimal(str(p["target_price"])),
+                    terminal=o.terminal,
+                    submitted_stop_child=o.submitted.stop_child if o.submitted else None,
+                    now=now,
+                )
+                log.warning(
+                    "recovered lost submission %s: status=%s filled=%s",
+                    o.intent_id, o.terminal.status.value, o.terminal.filled_qty,
+                )
+            elif o.kind is OutcomeKind.UNSUBMITTED:
+                self.trade_log.append_result(o.result_payload)
+                log.warning("submission %s never reached broker; sealed",
+                            o.intent_id)
+            elif o.kind is OutcomeKind.RETRY:
+                if o.incident is not None:
+                    self.trade_log.append_incident(o.incident)
+            elif o.kind is OutcomeKind.ESCALATE_HALT:
+                self._state.set_halt(
+                    o.halt_name, reason=o.halt_reason or o.intent_id, now=now
+                )
+                if o.incident is not None:
+                    self.trade_log.append_incident(o.incident)
+                self.state_store.save(self._state)
+                halted = True
+                log.error("recovery escalated to halt: %s (%s)",
+                          o.halt_name, o.halt_reason)
+        return halted
 
     # ---- market data helper (broker-only, no cache) ------------------
 

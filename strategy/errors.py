@@ -83,6 +83,23 @@ class MarketClosedRejection(PermanentBrokerError):
     """
 
 
+class OrderOutcomeUnknown(BrokerError):
+    """An order was (or may have been) accepted by the broker but its
+    terminal state is not yet known to us.
+
+    This is NOT a failure and NOT retry-the-call: re-POSTing is unnecessary
+    and unsafe to assume. It is a *normal* state for a resting limit order
+    whose fill latency exceeds our poll window. The orchestrator must treat
+    it as recoverable — persist the in-flight submission to the audit log
+    and resolve it on a later tick via the idempotent client_order_id,
+    never discard the order.
+
+    Deliberately a direct BrokerError child (neither Transient nor
+    Permanent): the HTTP call already succeeded; what's unknown is the
+    order's lifecycle, not the request's.
+    """
+
+
 # --- Risk / reconciliation / operational -----------------------------------
 
 

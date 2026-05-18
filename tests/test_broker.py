@@ -9,7 +9,9 @@ that implements the duck-typed methods the wrapper uses. We verify:
 * Retry policy respects max_retries and backoff (we use a fake sleep).
 * Idempotent COID: a DuplicateClientOrderId on resubmit is resolved via
   get_order_by_client_id and returns the existing order.
-* poll_terminal returns on terminal status, raises TimeoutError otherwise.
+* poll_terminal returns on terminal status, raises OrderOutcomeUnknown
+  otherwise (the order may still be live — never assume failure).
+* resolve_by_coid is a read-only (parent, stop_child) lookup for recovery.
 * flatten_symbol follows the 5-step sequence and never calls close_position.
 * cancel_order on an already-terminal order is a no-op.
 """
@@ -48,6 +50,7 @@ from strategy.errors import (
     AccountRestricted,
     DuplicateClientOrderId,
     MarketClosedRejection,
+    OrderOutcomeUnknown,
     OrderRejected,
     PermanentBrokerError,
     TransientBrokerError,
@@ -341,6 +344,42 @@ def test_submit_duplicate_coid_resolves_to_existing() -> None:
     client.get_order_by_client_id.assert_called_once_with(coid)
 
 
+def test_submit_duplicate_coid_recovers_protective_child() -> None:
+    """Finding A regression: on a duplicate-COID collision the resolved
+    SubmittedOrder must carry the protective stop child with correct
+    linkage. Pre-fix this path ran _pick_stop_child on a converted
+    BrokerOrder (no .legs) and silently returned stop_child=None — the
+    same child-loss class as the lost-fill bug. It must now resolve via
+    the raw order, identically to recovery.
+    """
+    b, client, _ = _broker()
+    intent = _intent()
+    coid = intent.client_order_id()
+
+    client.submit_order.side_effect = _api_error(422, "client_order_id already used")
+    existing = _sdk_order(coid=coid, order_class=SdkOrderClass.OTO)
+    existing.legs = [
+        _sdk_order(
+            broker_id="b-child",
+            coid="TBv1-child",
+            side=SdkOrderSide.SELL,
+            parent_coid=coid,
+            order_type="stop",
+        )
+    ]
+    client.get_order_by_client_id.return_value = existing
+
+    submitted = b.submit_entry_with_protection(intent)
+
+    assert submitted.parent.client_order_id == coid
+    # The assertion the original dup-COID test was missing:
+    assert submitted.stop_child is not None, "protective child lost on dup-COID path"
+    assert submitted.stop_child.leg_role == "stop_child"
+    assert submitted.stop_child.parent_client_order_id == coid
+    # Resolved read-only — never re-POSTed.
+    client.submit_order.assert_called_once()  # the initial (rejected) attempt only
+
+
 def test_submit_duplicate_coid_but_missing_raises() -> None:
     b, client, _ = _broker()
     intent = _intent()
@@ -366,11 +405,53 @@ def test_poll_terminal_returns_when_filled() -> None:
     assert order.avg_fill_price == Decimal("200.05")
 
 
-def test_poll_terminal_timeout() -> None:
+def test_poll_terminal_timeout_raises_order_outcome_unknown() -> None:
+    # Regression for the 2026-05-15 lost-fill bug: poll_terminal must NOT
+    # raise builtin TimeoutError (which escaped the StrategyError handler
+    # and abandoned a live order). It raises OrderOutcomeUnknown — a
+    # StrategyError — so the caller can persist + recover by COID.
     b, client, _ = _broker(poll_timeout_s=0.01)
     client.get_order_by_client_id.return_value = _sdk_order(status=SdkOrderStatus.NEW)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(OrderOutcomeUnknown) as ei:
         b.poll_terminal("TBv1-xxx")
+    # It must not be a builtin TimeoutError any more.
+    assert not isinstance(ei.value, TimeoutError)
+    # Message steers the operator/recovery toward COID resolution.
+    assert "resolve by COID" in str(ei.value)
+    assert "TBv1-xxx" in str(ei.value)
+
+
+def test_resolve_by_coid_returns_parent_and_stop_child() -> None:
+    b, client, _ = _broker()
+    parent = _sdk_order(coid="TBv1-recover", order_class=SdkOrderClass.OTO)
+    parent.legs = [
+        _sdk_order(
+            broker_id="b-stopchild",
+            coid="child-coid",
+            side=SdkOrderSide.SELL,
+            parent_coid="TBv1-recover",
+            order_type="stop",
+        )
+    ]
+    client.get_order_by_client_id.return_value = parent
+
+    resolved = b.resolve_by_coid("TBv1-recover")
+
+    assert resolved is not None
+    assert resolved.parent.client_order_id == "TBv1-recover"
+    assert resolved.stop_child is not None
+    assert resolved.stop_child.leg_role == "stop_child"
+    assert resolved.stop_child.parent_client_order_id == "TBv1-recover"
+    # READ-ONLY: recovery must never submit or cancel.
+    client.submit_order.assert_not_called()
+    client.cancel_order_by_id.assert_not_called()
+
+
+def test_resolve_by_coid_returns_none_when_broker_has_no_such_order() -> None:
+    b, client, _ = _broker()
+    client.get_order_by_client_id.side_effect = _api_error(404, "not found")
+    assert b.resolve_by_coid("TBv1-never-existed") is None
+    client.submit_order.assert_not_called()
 
 
 def test_poll_terminal_catches_done_for_day_as_terminal() -> None:
@@ -509,6 +590,43 @@ def test_flatten_with_no_position_is_safe() -> None:
     assert result.final_position_qty == 0
     # No submit_order call when there's nothing to close.
     client.submit_order.assert_not_called()
+
+
+def test_flatten_close_poll_timeout_raises_order_outcome_unknown() -> None:
+    """Propagation-delta pin (Tier 1).
+
+    flatten_symbol polls the close order via poll_terminal. Pre-fix, a
+    close that didn't reach terminal raised builtin TimeoutError, which
+    escaped _flatten_one's `except StrategyError` and aborted the whole
+    tick. Post-fix it raises OrderOutcomeUnknown — a StrategyError — so
+    _flatten_one can catch it, log an error RESULT, keep the position
+    tracked, and retry the exit next tick. This test pins the broker-level
+    half of that change (the strategy-level handling is covered in Tier 3).
+    """
+    from strategy.errors import StrategyError
+
+    b, client, _ = _broker(poll_timeout_s=0.01)
+    client.get_orders.return_value = []  # nothing to cancel
+    pos = SimpleNamespace(
+        symbol="AAPL", qty="10", avg_entry_price="200",
+        market_value="2000", unrealized_pl="0", side="long",
+    )
+    client.get_all_positions.return_value = [pos]
+    # Close submits fine but never reaches terminal on poll.
+    never_terminal = _sdk_order(
+        broker_id="b-close", coid="TBv1-close",
+        side=SdkOrderSide.SELL, status=SdkOrderStatus.NEW,
+    )
+    client.submit_order.return_value = never_terminal
+    client.get_order_by_client_id.return_value = never_terminal
+
+    with pytest.raises(OrderOutcomeUnknown) as ei:
+        b.flatten_symbol("AAPL", close_client_order_id="TBv1-close")
+    # The behaviourally-significant delta: it is now a StrategyError, so
+    # `except StrategyError` in _flatten_one will catch it (it did not
+    # before, when this was a builtin TimeoutError).
+    assert isinstance(ei.value, StrategyError)
+    assert not isinstance(ei.value, TimeoutError)
 
 
 def test_flatten_verifies_position_is_zero_or_raises() -> None:

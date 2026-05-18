@@ -72,6 +72,7 @@ from strategy.errors import (
     AccountRestricted,
     DuplicateClientOrderId,
     MarketClosedRejection,
+    OrderOutcomeUnknown,
     OrderRejected,
     PermanentBrokerError,
     TransientBrokerError,
@@ -560,11 +561,17 @@ class AlpacaBroker:
         try:
             raw = _with_retry(call, self._retry, sleep=self._sleep)
         except DuplicateClientOrderId:
-            existing = self.get_order_by_coid(intent.client_order_id())
-            if existing is None:
+            # A duplicate COID is proof the prior submission reached the
+            # broker. Resolve it the same read-only way recovery does.
+            # This also fixes a latent child-loss defect: the protective
+            # child must be picked off the *raw* order (which carries
+            # .legs); the previous code ran _pick_stop_child on a converted
+            # BrokerOrder and silently returned stop_child=None.
+            resolved = self.resolve_by_coid(intent.client_order_id())
+            if resolved is None:
                 # Duplicate but can't fetch — genuine problem, surface it.
                 raise
-            return SubmittedOrder(parent=existing, stop_child=_pick_stop_child(existing))
+            return resolved
 
         parent = _to_broker_order(raw)
         return SubmittedOrder(parent=parent, stop_child=_pick_stop_child(raw))
@@ -587,10 +594,42 @@ class AlpacaBroker:
             if order.is_terminal():
                 return order
             self._sleep(self._poll_interval_s)
-        raise TimeoutError(
+        raise OrderOutcomeUnknown(
             f"order {client_order_id} did not reach terminal status within "
             f"{timeout_s or self._poll_timeout_s}s "
-            f"(last status={last_seen.status.value if last_seen else 'unknown'})"
+            f"(last status={last_seen.status.value if last_seen else 'unknown'}). "
+            f"The order may still be live at the broker; resolve by COID, "
+            f"do not assume failure."
+        )
+
+    def resolve_by_coid(self, client_order_id: str) -> SubmittedOrder | None:
+        """Read-only recovery lookup: reconstruct the (parent, stop_child)
+        pair for an order we may have lost track of, purely by COID.
+
+        This performs NO submit and NO cancel — it only reads. Returns
+        ``None`` if the broker has no order for this COID (genuinely never
+        accepted, or not yet visible).
+
+        NOTE: it fetches the *raw* SDK order and runs ``_pick_stop_child``
+        on it directly — mirroring the fresh-submit path, not
+        ``get_order_by_coid``. ``_to_broker_order`` does not carry a
+        ``.legs`` attribute, so picking the child off a converted
+        ``BrokerOrder`` always yields ``None``. (The idempotent
+        ``DuplicateClientOrderId`` branch of
+        :meth:`submit_entry_with_protection` has this same latent defect —
+        flagged separately; recovery correctness requires the raw path.)
+        """
+        def call() -> Any:
+            return self._client.get_order_by_client_id(client_order_id)
+
+        try:
+            raw = _with_retry(call, self._retry, sleep=self._sleep)
+        except PermanentBrokerError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+        return SubmittedOrder(
+            parent=_to_broker_order(raw), stop_child=_pick_stop_child(raw)
         )
 
     def cancel_order(self, broker_order_id: str) -> None:
