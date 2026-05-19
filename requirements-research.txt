@@ -1,0 +1,19 @@
+# Research-only dependencies (backtester / edge validation).
+#
+# DELIBERATELY SEPARATE from production requirements.txt — installing this
+# file must never be required to run or deploy the trading engine. Keep the
+# research stack's dependency surface isolated from production.
+#
+# NOT installed in Phase 0 sub-task 0.0 (scaffold only). These are the
+# anticipated research-stack additions, pinned when sub-task 0.1+ begins:
+#
+#   pandas        # bar frames / resampling
+#   pyarrow       # parquet cache
+#
+# Reused (already present via the production engine — do NOT re-pin here, to
+# avoid version contamination):
+#   alpaca-py                 (historical bar fetch — same source as live)
+#   pandas-market-calendars   (XNYS sessions / holidays / half-days)
+#
+# Intentionally left without active pins until 0.1; this file exists now so
+# the separation boundary is established at scaffold time.
