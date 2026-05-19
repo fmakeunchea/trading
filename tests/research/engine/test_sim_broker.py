@@ -25,13 +25,6 @@ from strategy.dto import (
 UTC = timezone.utc
 
 
-@pytest.fixture(autouse=True)
-def _deterministic_oids():
-    sb._reset_oid_seq_for_tests()
-    yield
-    sb._reset_oid_seq_for_tests()
-
-
 # --- builders --------------------------------------------------------------
 
 def _frame_1m(symbol: str, start: datetime, n: int, base: float = 100.0):
@@ -267,11 +260,11 @@ def test_account_equity_marks_position_to_market() -> None:
 # --- determinism -----------------------------------------------------------
 
 def test_two_brokers_with_same_setup_produce_identical_sequences() -> None:
-    """Determinism (seed for the harder gate in 1.2): the same setup
-    must produce identical observable output (account snapshot equity +
-    broker_order_ids on the same operations)."""
+    """Determinism (seed for the harder gate in 1.2): two completely
+    independent broker instances with identical setup produce identical
+    observable output (broker_order_ids + equity). The per-instance OID
+    counter starts at 0 for each broker, so identity holds by construction."""
     def run():
-        sb._reset_oid_seq_for_tests()
         start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
         bars = {("SPY", 1): _frame_1m("SPY", start, 60)}
         b = sb.SimulatedBroker(bars=bars, starting_cash=Decimal("100000"),

@@ -115,6 +115,13 @@ class SimulatedBroker:
         self._open_orders: list[BrokerOrder] = []
         self._submitted: dict[str, SubmittedOrder] = {}   # by parent COID
         self._symbols_seen: set[str] = {sym for (sym, _) in self._bars}
+        # Per-instance, monotonic broker_order_id counter — deterministic
+        # by construction across runs (no module-level state).
+        self._oid_seq: int = 0
+
+    def _next_oid(self, prefix: str) -> str:
+        self._oid_seq += 1
+        return f"sim-{prefix}-{self._oid_seq:08d}"
 
     # ---- clock ----------------------------------------------------------
 
@@ -236,7 +243,7 @@ class SimulatedBroker:
         if debit > self._cash:
             # Treat as a broker-side rejection — produce a non-filled parent.
             parent = BrokerOrder(
-                broker_order_id=_oid("rej"), client_order_id=coid,
+                broker_order_id=self._next_oid("rej"), client_order_id=coid,
                 symbol=intent.symbol, side=intent.side, qty=intent.qty,
                 filled_qty=0, avg_fill_price=None, status=OrderStatus.REJECTED,
                 order_class=OrderClass.OTO, submitted_at=now, filled_at=None,
@@ -251,7 +258,7 @@ class SimulatedBroker:
             symbol=intent.symbol, qty=intent.qty, avg_entry_price=fill_price,
         )
         parent = BrokerOrder(
-            broker_order_id=_oid("parent"), client_order_id=coid,
+            broker_order_id=self._next_oid("parent"), client_order_id=coid,
             symbol=intent.symbol, side=intent.side, qty=intent.qty,
             filled_qty=intent.qty, avg_fill_price=fill_price,
             status=OrderStatus.FILLED, order_class=OrderClass.OTO,
@@ -259,7 +266,7 @@ class SimulatedBroker:
             parent_client_order_id=None, leg_role="parent",
         )
         stop_child = BrokerOrder(
-            broker_order_id=_oid("stop"),
+            broker_order_id=self._next_oid("stop"),
             client_order_id=f"sim-stop-{coid}",
             symbol=intent.symbol, side=OrderSide.SELL, qty=intent.qty,
             filled_qty=0, avg_fill_price=None, status=OrderStatus.HELD,
@@ -300,7 +307,7 @@ class SimulatedBroker:
         pos = self._positions.pop(symbol, None)
         if pos is None or pos.qty == 0:
             close = BrokerOrder(
-                broker_order_id=_oid("close-noop"),
+                broker_order_id=self._next_oid("close-noop"),
                 client_order_id=close_client_order_id,
                 symbol=symbol, side=OrderSide.SELL, qty=0, filled_qty=0,
                 avg_fill_price=None, status=OrderStatus.FILLED,
@@ -313,7 +320,7 @@ class SimulatedBroker:
         exit_price = self._latest_mid(symbol) or pos.avg_entry_price
         self._cash += exit_price * Decimal(pos.qty)
         close = BrokerOrder(
-            broker_order_id=_oid("close"),
+            broker_order_id=self._next_oid("close"),
             client_order_id=close_client_order_id,
             symbol=symbol, side=OrderSide.SELL, qty=pos.qty, filled_qty=pos.qty,
             avg_fill_price=exit_price, status=OrderStatus.FILLED,
@@ -324,21 +331,3 @@ class SimulatedBroker:
                            close_order=close, final_position_qty=0)
 
 
-# --- internal helpers ------------------------------------------------------
-
-_OID_SEQ = 0
-
-
-def _oid(prefix: str) -> str:
-    """Deterministic-per-process unique id (sequential, not random — keeps
-    SimulatedBroker output byte-identical across runs in the same process)."""
-    global _OID_SEQ
-    _OID_SEQ += 1
-    return f"sim-{prefix}-{_OID_SEQ:08d}"
-
-
-def _reset_oid_seq_for_tests() -> None:
-    """Test-only helper: reset the per-process sequence so two
-    SimulatedBroker fixtures in the same test session start clean."""
-    global _OID_SEQ
-    _OID_SEQ = 0
