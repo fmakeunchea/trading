@@ -16,5 +16,13 @@ pandas-market-calendars
 # Needed from sub-task 0.4 (parquet cache) onward; cheap to install now:
 pyarrow
 
+# Tests for the research stack run in this venv too (the engine .venv
+# can't run them because pandas-market-calendars is research-only).
+# pytest-cov is required so the repo's default addopts (--cov=strategy)
+# is a recognized option; disable measurement on research-only runs with
+# `--no-cov` (strategy/ is not imported by research tests).
+pytest
+pytest-cov
+
 # Versions are intentionally loose at scaffold time — pin precisely once
 # Phase 0 is green and we know what the research stack actually exercises.
