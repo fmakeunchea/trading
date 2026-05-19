@@ -26,6 +26,16 @@ V1_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT"]
 
 
 @dataclass(frozen=True, slots=True)
+class ThinDay:
+    """A trading day with abnormally few 1m bars, classified against the
+    XNYS calendar so legitimate half-day early-closes are not confused
+    with genuine data gaps."""
+    date_iso: str
+    bar_count: int
+    is_half_day: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolProfile:
     symbol: str
     requested_start: datetime
@@ -38,6 +48,8 @@ class SymbolProfile:
     coverage_pct: float
     low_volume_days: int          # days with < 50% of a full session's 1m bars
     sample_resample_ok: bool | None
+    thin_days: tuple[ThinDay, ...]
+    unexplained_thin: int          # thin days NOT explained by XNYS half-day
     note: str
 
 
@@ -54,11 +66,26 @@ def _client():
     return StockHistoricalDataClient(key, sec)
 
 
-def _xnys_trading_days(start: datetime, end: datetime) -> int:
+def _xnys_schedule(start: datetime, end: datetime):
     import pandas_market_calendars as mcal
     cal = mcal.get_calendar("XNYS")
-    sched = cal.schedule(start_date=start.date(), end_date=end.date())
-    return len(sched)
+    return cal.schedule(start_date=start.date(), end_date=end.date())
+
+
+def _xnys_trading_days(start: datetime, end: datetime) -> int:
+    return len(_xnys_schedule(start, end))
+
+
+def _xnys_half_days(start: datetime, end: datetime) -> set:
+    """Set of dates whose XNYS session is shorter than the standard ~6.5 h
+    (early-close days — July 3rd, day-after-Thanksgiving, Christmas Eve …)."""
+    sched = _xnys_schedule(start, end)
+    half: set = set()
+    for ts, row in sched.iterrows():
+        if (row["market_close"] - row["market_open"]).total_seconds() < 6 * 3600:
+            d = ts.date() if hasattr(ts, "date") else ts
+            half.add(d)
+    return half
 
 
 def _profile_symbol(client, symbol: str, start: datetime, end: datetime,
@@ -80,7 +107,7 @@ def _profile_symbol(client, symbol: str, start: datetime, end: datetime,
     if not bars:
         return SymbolProfile(
             symbol, start, end, None, None, 0, 0,
-            _xnys_trading_days(start, end), 0.0, 0, None,
+            _xnys_trading_days(start, end), 0.0, 0, None, (), 0,
             "NO DATA RETURNED for window — IEX likely lacks this history",
         )
     ts = [b.timestamp.astimezone(timezone.utc) for b in bars]
@@ -91,8 +118,16 @@ def _profile_symbol(client, symbol: str, start: datetime, end: datetime,
     distinct = len(days)
     expected = _xnys_trading_days(first, last)
     coverage = round(100.0 * distinct / expected, 2) if expected else 0.0
-    # A full regular session ~ 390 1m bars; flag thin days.
-    low_vol = sum(1 for c in days.values() if c < 195)
+    # A full regular session ~ 390 1m bars; flag thin days, then classify
+    # each one against the XNYS early-close schedule (legitimate half-days
+    # are expected to be thin and must not count as "gaps").
+    half_set = _xnys_half_days(first, last)
+    thin_records: list[ThinDay] = []
+    for d, c in sorted(days.items()):
+        if c < 195:
+            thin_records.append(ThinDay(d.isoformat(), c, d in half_set))
+    unexplained = sum(1 for t in thin_records if not t.is_half_day)
+    low_vol = len(thin_records)
 
     # Native-5m vs resample-from-1m sanity on the most recent full day.
     sample_ok: bool | None = None
@@ -101,13 +136,13 @@ def _profile_symbol(client, symbol: str, start: datetime, end: datetime,
     except Exception:  # noqa: BLE001 — diagnostic only
         sample_ok = None
 
-    note = "looks usable" if coverage >= 95 and low_vol == 0 else (
-        "SUSPECT — coverage/gaps may be insufficient for a multi-regime "
-        "walk-forward study"
+    note = (
+        "looks usable" if (coverage >= 99 and unexplained == 0 and sample_ok)
+        else "SUSPECT — review coverage / unexplained thin days"
     )
     return SymbolProfile(
         symbol, start, end, first, last, len(ts), distinct, expected,
-        coverage, low_vol, sample_ok, note,
+        coverage, low_vol, sample_ok, tuple(thin_records), unexplained, note,
     )
 
 
@@ -168,11 +203,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  1m bars       : {pr.total_1m_bars:,}")
         print(f"  days covered  : {pr.distinct_days} / {pr.expected_trading_days} "
               f"expected  ({pr.coverage_pct}%)")
-        print(f"  thin days     : {pr.low_volume_days}")
+        print(f"  thin days     : {pr.low_volume_days} "
+              f"(unexplained: {pr.unexplained_thin})")
+        if pr.thin_days:
+            for td in pr.thin_days:
+                tag = "half-day" if td.is_half_day else "UNEXPLAINED"
+                print(f"    - {td.date_iso}  bars={td.bar_count:>3}  [{tag}]")
         print(f"  5m resample   : {pr.sample_resample_ok}")
         print(f"  verdict       : {pr.note}\n")
 
-    usable = all(v.coverage_pct >= 95 and v.low_volume_days == 0
+    usable = all(v.coverage_pct >= 99 and v.unexplained_thin == 0
                  and v.sample_resample_ok for v in verdicts
                  if v.total_1m_bars)
     any_empty = any(v.total_1m_bars == 0 for v in verdicts)
@@ -181,10 +221,14 @@ def main(argv: list[str] | None = None) -> int:
         print("OVERALL: IEX returned NO data for at least one symbol — "
               "history depth insufficient. Consider SIP / provider pivot.")
         return 2
-    print("OVERALL:", "IEX looks usable for V1." if usable else
-          "IEX is SUSPECT — review coverage/gaps before committing the "
-          "research stack to it (SIP or shorter study window may be needed).")
-    return 0 if usable else 1
+    if usable:
+        print("OVERALL: IEX looks USABLE for V1 — coverage >=99%, every thin "
+              "day explained by the XNYS half-day calendar, native-5m == "
+              "1m-resample within cents.")
+        return 0
+    print("OVERALL: IEX is SUSPECT — at least one symbol has unexplained "
+          "thin days or sub-99% coverage. Investigate before committing.")
+    return 1
 
 
 if __name__ == "__main__":  # pragma: no cover
