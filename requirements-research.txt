@@ -2,18 +2,19 @@
 #
 # DELIBERATELY SEPARATE from production requirements.txt — installing this
 # file must never be required to run or deploy the trading engine. Keep the
-# research stack's dependency surface isolated from production.
+# research stack's dependency surface isolated.
 #
-# NOT installed in Phase 0 sub-task 0.0 (scaffold only). These are the
-# anticipated research-stack additions, pinned when sub-task 0.1+ begins:
+# Recommended install target: a dedicated venv (e.g. .venv-research),
+# NOT the engine's .venv. This is what "research is separable" means in
+# practice.
 #
-#   pandas        # bar frames / resampling
-#   pyarrow       # parquet cache
-#
-# Reused (already present via the production engine — do NOT re-pin here, to
-# avoid version contamination):
-#   alpaca-py                 (historical bar fetch — same source as live)
-#   pandas-market-calendars   (XNYS sessions / holidays / half-days)
-#
-# Intentionally left without active pins until 0.1; this file exists now so
-# the separation boundary is established at scaffold time.
+# Deps the probe + Phase 0 sub-tasks need NOW:
+alpaca-py
+pandas
+pandas-market-calendars
+
+# Needed from sub-task 0.4 (parquet cache) onward; cheap to install now:
+pyarrow
+
+# Versions are intentionally loose at scaffold time — pin precisely once
+# Phase 0 is green and we know what the research stack actually exercises.
