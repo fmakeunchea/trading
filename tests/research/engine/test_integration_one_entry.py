@@ -155,7 +155,10 @@ def test_one_entry_cycle_end_to_end(tmp_path) -> None:
         f"{[(r.payload.get('symbol'), r.payload.get('result'), r.payload.get('reason')) for r in res.intents]}"
     )
     submit = aapl_submits[0]
-    assert submit.payload["side"] == "BUY"
+    # Side is stringified via OrderSide(str, Enum).value == "buy" (lowercase).
+    # Asserting on the enum's .value pins the audit format to production.
+    from strategy.dto import OrderSide
+    assert submit.payload["side"] == OrderSide.BUY.value
     assert submit.payload["qty_requested"] > 0
     assert submit.payload["reason"] == "breakout_with_trend_and_confirmation"
 
