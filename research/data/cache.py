@@ -100,7 +100,17 @@ def cache_paths(cache_dir: str | Path, symbol: str, year: int,
 def _atomic_write_parquet(df, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_parquet(tmp, compression="snappy", index=True)
+    # Pandas serializes ``df.attrs`` into parquet metadata via
+    # ``json.dumps``. ``research.data.alpaca_source.fetch_1m_bars``
+    # stamps ``df.attrs["quarantined"]`` with a tuple of ``date`` objects,
+    # which is not JSON-serializable and crashes the writer. Strip attrs
+    # on write — the durable metadata record is the sibling manifest
+    # JSON; ``df.attrs`` is in-process convenience only (``pd.read_parquet``
+    # doesn't restore them anyway).
+    df_to_write = df if not df.attrs else df.copy(deep=False)
+    if df.attrs:
+        df_to_write.attrs = {}
+    df_to_write.to_parquet(tmp, compression="snappy", index=True)
     os.replace(tmp, path)  # atomic on same fs
 
 

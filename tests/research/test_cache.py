@@ -254,6 +254,43 @@ def test_round_trip_preserves_index_and_dtypes(tmp_path) -> None:
 
 
 @requires_pyarrow
+def test_write_strips_non_jsonable_attrs(tmp_path) -> None:
+    """``alpaca_source.fetch_1m_bars`` stamps ``df.attrs["quarantined"]``
+    with a tuple of ``date`` objects. Pandas serializes ``df.attrs`` via
+    ``json.dumps`` into parquet metadata, which crashes on ``date``.
+    The cache writer must scrub attrs before write — the durable
+    metadata record is the sibling manifest JSON.
+
+    Regression: surfaced on the first real-data spike (2026-05-20),
+    when a 6-month AAPL 1m fetch tripped the parquet writer.
+    """
+    import pandas as pd
+    df = _bars(3, start_ts=pd.Timestamp("2025-01-02 14:30", tz="UTC"))
+    df.attrs.update(
+        symbol="AAPL", feed="iex", adjustment="all",
+        quarantined=(date(2024, 12, 23),),  # the failing non-JSON case
+    )
+
+    def fetch_with_attrs(symbol, start, end, **kw):
+        return df.copy()  # .copy() preserves attrs
+
+    args = dict(
+        symbol="AAPL",
+        start=datetime(2025, 1, 2, tzinfo=timezone.utc),
+        end=datetime(2025, 1, 3, tzinfo=timezone.utc),
+        cache_dir=tmp_path,
+        fetch_1m=fetch_with_attrs,
+        code_sha="abc",
+    )
+    # Must not raise — would have raised TypeError pre-fix.
+    out = cache.cache_1m_bars(**args)
+    assert len(out) == 3
+    # Cache round-trip succeeded; read-back drops attrs (pandas behaviour).
+    out2 = cache.cache_1m_bars(**args)  # cache hit
+    pd.testing.assert_frame_equal(out, out2)
+
+
+@requires_pyarrow
 def test_empty_fetch_caches_empty_frame_with_manifest(tmp_path) -> None:
     """Edge case: a fetch returning no bars still writes an empty cache
     entry + manifest (so we don't re-fetch identical empty windows)."""
