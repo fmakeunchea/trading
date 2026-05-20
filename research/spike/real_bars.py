@@ -107,6 +107,99 @@ def _max_drawdown(equity: list[tuple[datetime, Decimal]],
     return max_dd
 
 
+def _analyze_trades(res) -> dict:
+    """Per-trade analytics from the RunResult records.
+
+    Derives win rate, expectancy, exit-reason mix, hold-time stats by
+    pairing each entry fill with its subsequent close result (one
+    position per symbol at a time, so a simple stack by symbol works).
+    Close RESULTs already carry ``realized_pnl`` and ``reason``, so no
+    re-computation of P&L from prices is needed (avoids float-vs-Decimal
+    drift).
+    """
+    # Index entry fills by intent_id (these are the parent fills).
+    entry_fills_by_iid = {
+        r.payload["intent_id"]: r for r in res.results
+        if r.payload.get("intent_id", "").startswith("entry-")
+        and r.payload.get("status") == "filled"
+    }
+    # Close results carry realized_pnl + reason. The pairing key is symbol:
+    # there's at most one open position per symbol at a time.
+    open_entry_by_sym: dict[str, str] = {}
+    # Walk records in temporal (insertion) order to preserve pairing.
+    closes = []
+    for r in res.results:
+        iid = r.payload.get("intent_id", "")
+        sym_str = iid.split("-", 2)[1] if iid.count("-") >= 2 else "?"
+        if iid.startswith("entry-") and r.payload.get("status") == "filled":
+            open_entry_by_sym[sym_str] = iid
+        elif iid.startswith("close-") and r.payload.get("status") == "filled":
+            entry_iid = open_entry_by_sym.pop(sym_str, None)
+            if entry_iid is None:
+                continue  # orphan close — shouldn't happen on a fresh run
+            entry_fill = entry_fills_by_iid.get(entry_iid)
+            if entry_fill is None:
+                continue
+            try:
+                pnl = Decimal(r.payload["realized_pnl"])
+            except Exception:
+                pnl = Decimal(0)
+            closes.append({
+                "symbol": sym_str,
+                "entry_ts": entry_fill.ts,
+                "exit_ts": r.ts,
+                "entry_price": Decimal(entry_fill.payload.get("avg_fill_price", "0")),
+                "exit_price":  Decimal(r.payload.get("avg_fill_price", "0")),
+                "qty":         int(entry_fill.payload.get("filled_qty", 0)),
+                "pnl":         pnl,
+                "reason":      r.payload.get("reason", "?"),
+            })
+
+    if not closes:
+        return {"n": 0, "closes": []}
+
+    pnls = [c["pnl"] for c in closes]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    breakeven = [p for p in pnls if p == 0]
+    total_pnl = sum(pnls)
+
+    def _avg(xs):
+        if not xs:
+            return Decimal(0)
+        return sum(xs) / Decimal(len(xs))
+
+    holds_min = [
+        (c["exit_ts"] - c["entry_ts"]).total_seconds() / 60.0
+        for c in closes
+    ]
+
+    from collections import Counter
+    reason_hist = Counter(c["reason"] for c in closes)
+
+    return {
+        "n":             len(closes),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "breakeven":     len(breakeven),
+        "win_rate":      Decimal(len(wins)) / Decimal(len(closes)) * Decimal(100),
+        "total_pnl":     total_pnl,
+        "avg_pnl":       _avg(pnls),
+        "avg_win":       _avg(wins),
+        "avg_loss":      _avg(losses),
+        # Expectancy in $: win_rate * avg_win - loss_rate * |avg_loss|.
+        "expectancy":    (Decimal(len(wins))/Decimal(len(closes)) * _avg(wins)
+                          + Decimal(len(losses))/Decimal(len(closes)) * _avg(losses)),
+        "best_pnl":      max(pnls),
+        "worst_pnl":     min(pnls),
+        "hold_min_mean": sum(holds_min) / len(holds_min) if holds_min else 0,
+        "hold_min_min":  min(holds_min) if holds_min else 0,
+        "hold_min_max":  max(holds_min) if holds_min else 0,
+        "reason_hist":   reason_hist,
+        "closes":        closes,
+    }
+
+
 # --- main -----------------------------------------------------------------
 
 def _banner(line: str) -> str:
@@ -134,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
         "--history-pad-days", type=int, default=180,
         help="Calendar days of bar history to prefetch before --start "
              "(must cover min_bars_trend_tf * _CAL_BUFFER ≈ 140 days)",
+    )
+    ap.add_argument(
+        "--save-records",
+        help="Path to save RunResult as JSONL (intents/results/incidents) "
+             "for offline re-analysis without re-running the backtest.",
     )
     args = ap.parse_args(argv)
 
@@ -252,6 +350,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {reason:35s} {n:>8,}")
         print()
 
+    # Per-trade analytics (paired entry→close, with realized P&L and exit reason)
+    trades = _analyze_trades(res)
+    if trades["n"] > 0:
+        print(_banner(f"PER-TRADE ANALYTICS  (n={trades['n']} round-trips)"))
+        print(f"Wins / Losses / BE   : "
+              f"{trades['wins']} / {trades['losses']} / {trades['breakeven']}")
+        print(f"Win rate             : {trades['win_rate']:.1f}%")
+        print(f"Total P&L            : ${trades['total_pnl']:>10,.2f}")
+        print(f"Avg P&L per trade    : ${trades['avg_pnl']:>10,.2f}")
+        print(f"Avg win              : ${trades['avg_win']:>10,.2f}")
+        print(f"Avg loss             : ${trades['avg_loss']:>10,.2f}")
+        print(f"Expectancy ($/trade) : ${trades['expectancy']:>10,.2f}")
+        print(f"Best / Worst trade   : ${trades['best_pnl']:>10,.2f} / "
+              f"${trades['worst_pnl']:.2f}")
+        print(f"Hold time (min)      : "
+              f"avg={trades['hold_min_mean']:.0f}  "
+              f"min={trades['hold_min_min']:.0f}  "
+              f"max={trades['hold_min_max']:.0f}")
+        print()
+        print("Exit-reason breakdown:")
+        for reason, n in trades["reason_hist"].most_common():
+            pct = n / trades["n"] * 100
+            print(f"  {reason:25s} {n:>4}  ({pct:>5.1f}%)")
+        print()
+
     # Per-symbol fill summary
     if fills:
         by_sym: dict[str, list] = {}
@@ -272,6 +395,35 @@ def main(argv: list[str] | None = None) -> int:
                   f"qty={p.get('filled_qty'):>4}  "
                   f"px=${p.get('avg_fill_price'):>8}  "
                   f"id={p.get('intent_id')}")
+
+    # Optional: persist the run records to JSONL for offline re-analysis.
+    # Includes intents, results, incidents AND the equity series so a
+    # future analyzer can compute extra metrics without re-running.
+    if args.save_records:
+        import json
+        out_path = Path(args.save_records)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            for kind_name, recs in (
+                ("intent", res.intents),
+                ("result", res.results),
+                ("incident", res.incidents),
+            ):
+                for r in recs:
+                    f.write(json.dumps({
+                        "record_kind": kind_name,
+                        "ts": r.ts.isoformat(),
+                        "payload": r.payload,
+                        "line_hash": r.line_hash,
+                        "prev_hash": r.prev_hash,
+                    }) + "\n")
+            for t, eq in res.equity:
+                f.write(json.dumps({
+                    "record_kind": "equity",
+                    "ts": t.isoformat(),
+                    "equity": str(eq),
+                }) + "\n")
+        print(f"Records saved: {out_path}")
 
     print()
     print(_banner("⚠️  REMINDER: PROVISIONAL — NOT A VERDICT  ⚠️"))
