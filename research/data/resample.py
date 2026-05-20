@@ -100,12 +100,22 @@ def resample(df_1m, tf_minutes: int):
             continue
         # Anchor bucketing on the session open so half-days, DST, and
         # arbitrary tf_minutes all align cleanly to session boundaries.
+        #
+        # ``dropna(subset=ohlc, how="any")`` — NOT ``how="all"`` — is the
+        # correct drop. An empty source bucket yields ``[NaN, NaN, NaN,
+        # NaN, 0]`` (the ``"sum"`` of empty is 0, NOT NaN), so ``how="all"``
+        # leaves the row alive and downstream consumers see a phantom bar
+        # with NaN OHLC. ``Decimal(str(nan))`` is ``Decimal('NaN')``,
+        # which (unlike float NaN) raises ``InvalidOperation`` on
+        # arithmetic — crashing ATR / true_range on first real-data
+        # contact in illiquid 5-minute windows. Surfaced by Phase-4
+        # spike (2026-05-20).
         bucketed = (
             in_session
             .resample(f"{tf_minutes}min", label="left", closed="left",
                       origin=open_utc)
             .agg(_OHLCV_AGG)
-            .dropna(how="all")
+            .dropna(subset=["open", "high", "low", "close"], how="any")
         )
         if not bucketed.empty:
             pieces.append(bucketed)

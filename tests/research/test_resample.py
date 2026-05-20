@@ -140,6 +140,56 @@ def test_resample_does_not_bleed_across_sessions() -> None:
 
 
 @requires_pmc
+def test_resample_drops_empty_buckets_no_nan_ohlc_leak() -> None:
+    """An empty 1m bucket inside a session must NOT produce a phantom
+    NaN-OHLC row.
+
+    Pandas resample of an empty group yields ``[NaN, NaN, NaN, NaN]`` for
+    ``first/max/min/last`` but ``0`` for ``sum`` (volume). The earlier
+    ``dropna(how="all")`` left such rows alive — they then poisoned
+    downstream consumers: ``Decimal(str(nan)) == Decimal('NaN')``, and
+    Python's ``decimal`` raises ``InvalidOperation`` on arithmetic
+    (unlike float, which propagates silently). The first ATR computation
+    on a frame containing one such row would crash the strategy.
+
+    Surfaced by the Phase-4 spike (2026-05-20) running 2024 IEX bars
+    through ``BacktestDriver``; AAPL had illiquid 5-minute windows in
+    late-afternoon sessions producing empty buckets.
+    """
+    d = date(2026, 6, 1)             # full regular session
+    from research.data import calendar as cal
+    open_utc, _ = cal.session_bounds(d)
+    # Two 1m bars at the session open, then a 30-minute gap (which spans
+    # six full 5m buckets), then two more bars later.
+    ts_list = [
+        open_utc + timedelta(minutes=0),
+        open_utc + timedelta(minutes=1),
+        # ── gap from 13:32 to 14:02 — covers 5m buckets at 13:30 (partial,
+        #    already populated), 13:35, 13:40, 13:45, 13:50, 13:55 (all empty)
+        open_utc + timedelta(minutes=33),
+        open_utc + timedelta(minutes=34),
+    ]
+    df = pd.DataFrame({
+        "open":   [100.0, 100.1, 100.5, 100.6],
+        "high":   [100.2, 100.3, 100.7, 100.8],
+        "low":    [ 99.9, 100.0, 100.4, 100.5],
+        "close":  [100.1, 100.2, 100.6, 100.7],
+        "volume": [1000, 1000, 1000, 1000],
+    }, index=pd.DatetimeIndex(ts_list, tz="UTC", name="ts"))
+
+    out = rs.resample(df, 5)
+
+    # Must NEVER have NaN in OHLC — that's the regression assertion.
+    for col in ("open", "high", "low", "close"):
+        assert not out[col].isna().any(), (
+            f"resample emitted NaN in {col}; phantom empty-bucket row "
+            f"would crash downstream Decimal arithmetic"
+        )
+    # And only the two populated buckets remain (13:30 and 14:00 with offsets).
+    assert len(out) == 2
+
+
+@requires_pmc
 def test_resample_drops_out_of_session_bars_defensively() -> None:
     """Pre/post-market bars must be filtered, not aggregated."""
     d = date(2026, 6, 1)
