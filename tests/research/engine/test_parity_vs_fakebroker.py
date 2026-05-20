@@ -2,30 +2,56 @@
 
 The keystone parity claim: ``SimulatedBroker`` is **functionally
 equivalent** to the ``FakeBroker`` the production unit tests already
-trust. Same Strategy class + same setup, run once through each, must
-produce the same observable decisions (entries_submitted, denies, intent
-reasons, open_trades state). If this passes, the simulator is
-**anchored to a known-good reference**, not just to itself — and any
-future drift in either side breaks here loudly.
+trust, *on the shared semantic space*. Same Strategy class + same
+setup, run once through each, must produce the same observable
+decisions (entries_submitted, denies, open_trades state).
+
+The "shared semantic space" caveat matters — see the finding below.
+
+Finding (anti-leak gap)
+-----------------------
+The production ``FakeBroker`` does NOT enforce anti-leak: its
+``get_bars`` returns everything in its dict regardless of the current
+clock. The in-repo unit-test fixtures exploit this — they install bars
+whose ``ts`` extends **after** ``NOW`` and rely on the strategy
+seeing them anyway. The ``SimulatedBroker`` (correctly) clips at
+``ts <= now - tf``; with the same fixture bars, it returns ~11 bars,
+far below ``min_bars_entry_tf=100``, and the entry path is silently
+short-circuited.
+
+This is not a bug in either side. It is a meaningful semantic
+divergence: the Phase-0 anti-leak invariant ("future-bar access
+impossible by construction") is a stricter guarantee than the
+unit-test FakeBroker provides. Reusing FakeBroker fixture bars
+verbatim through SimulatedBroker is incorrect.
+
+Resolution for this test: build bars that are entirely **causal**
+relative to ``NOW`` (last bar's ``ts`` < ``NOW``) so both brokers
+see the same bar set. The parity claim narrows to the shared space
+both implementations correctly model, which is exactly what we need
+to prove "no logic drift in the broker surface."
+
+This finding will be revisited and pinned by 0.6 (anti-leak hardening
+tests) — see [[project_backtester_design]].
 
 What this PROVES
 ----------------
-* No logic drift in the broker surface — same duck-typed contract,
-  equivalent fill semantics on the perfect-fill path, equivalent
-  anti-leak bar semantics for the inputs the strategy queries.
-* The same Strategy code yields the same denies/entries when fed
-  scenarios from the in-repo unit-test fixtures.
+* On causally-correct inputs, same Strategy + same bars + equivalent
+  quote semantics → same entries_submitted, same denies, same
+  open_trades structure across both broker implementations.
+* The SimulatedBroker's perfect-fill semantics match the FakeBroker's
+  perfect-fill semantics on the shared path.
 
 What this DOES NOT prove
 ------------------------
 * Signal QUALITY (synthetic bars; says nothing about real-data edge).
-* Realism of perfect-fill (Phase 1 limitation, still loudly labeled
-  elsewhere; Phase 2 adds slippage/commissions).
-* Byte-exact prices. ``SimulatedBroker`` stores DataFrame floats and
-  recovers via ``Decimal(str(float))``; a price like ``Decimal("180.10")``
-  may round-trip as ``Decimal("180.10000000000005")`` at the ~1e-13
-  level. Strategy DECISIONS are unaffected (everything quantizes to
-  cents downstream), but we compare prices at 0.01 tolerance.
+* Realism of perfect-fill (Phase 1 limitation, loudly labeled).
+* Byte-equal payload fields. Float-vs-Decimal precision (DataFrame
+  floats round-trip via ``Decimal(str(float))`` at ~1e-13). Strategy
+  DECISIONS are unaffected; price-like fields are compared at cents
+  resolution.
+* Equivalence under FakeBroker's looser anti-leak semantics —
+  intentionally out of scope (see Finding above).
 
 The verdict-gate caveat (0.6 anti-leak hardening) is still in force —
 build/run/inspect, not a verdict.
@@ -94,42 +120,108 @@ def _bars_to_df(bars: list[Bar]):
 _TF_MIN_TO_NAME = {5: "5Min", 15: "15Min", 60: "1Hour"}
 
 
+def _uptrend(symbol: str, last_ts: datetime, n_bars: int, tf_min: int,
+             *, base: Decimal = Decimal("100.00"),
+             step: Decimal = Decimal("0.15"),
+             wick: Decimal = Decimal("0.10")) -> list[Bar]:
+    """Monotonic uptrend bars ending at ``last_ts`` (causal — all in the
+    past of any future ``now``).
+
+    step > wick => close[i] > high[i-1], so the breakout condition
+    fires on every bar after indicator warmup (same pattern as
+    ``test_integration_one_entry.py``). ATR/close stays in
+    [0.0005, 0.03] for typical price ranges.
+    """
+    bars: list[Bar] = []
+    for i in range(n_bars):
+        ts = last_ts - timedelta(minutes=tf_min * (n_bars - 1 - i))
+        close = base + step * i
+        prev_close = base if i == 0 else (base + step * (i - 1))
+        bars.append(Bar(
+            symbol=symbol, ts=ts,
+            open=prev_close,
+            high=close + wick,
+            low=close - wick,
+            close=close,
+            volume=1000,
+        ))
+    return bars
+
+
+def _flat(symbol: str, last_ts: datetime, n_bars: int, tf_min: int,
+          *, price: Decimal = Decimal("100.00")) -> list[Bar]:
+    """Flat-price bars — no breakout possible."""
+    bars: list[Bar] = []
+    for i in range(n_bars):
+        ts = last_ts - timedelta(minutes=tf_min * (n_bars - 1 - i))
+        bars.append(Bar(
+            symbol=symbol, ts=ts,
+            open=price, high=price, low=price, close=price, volume=1000,
+        ))
+    return bars
+
+
+# Per-TF bar counts comfortably above min_bars_*_tf (100 / 60 / 210).
+_N_BARS = {5: 130, 15: 80, 60: 250}
+
+
 def _canonical_bars_clean_entry() -> dict[tuple[str, int], list[Bar]]:
-    """Replicates tests/test_strategy.py's `broker` fixture bar setup —
-    forces an entry-fireable trend on both AAPL and MSFT."""
+    """Causal bars (all ts < NOW): AAPL rises, MSFT flat.
+
+    AAPL's monotonic uptrend triggers a breakout on every bar after
+    warmup. MSFT's flat series cannot break out → signal-side denial,
+    only DIAGNOSTIC incidents.
+
+    Each timeframe's last ``ts = NOW - tf_min`` so the latest bar's
+    ``close_ts == NOW`` (fresh under both brokers). The SimulatedBroker
+    clip at ``ts <= now - tf`` keeps the full set in scope; the
+    FakeBroker returns the full set unconditionally. Both brokers thus
+    expose the strategy to the same bar set.
+    """
     out: dict[tuple[str, int], list[Bar]] = {}
-    for sym in ("AAPL", "MSFT"):
-        out[(sym, 5)] = _synth_trend(
-            sym, 120, start_price=Decimal("180"), step=Decimal("0.10"),
-            start_ts=datetime(2026, 4, 23, 13, 35, tzinfo=UTC),
-            tf_minutes=5, force_breakout=True,
-        )
-        out[(sym, 15)] = _synth_trend(
-            sym, 80, start_price=Decimal("170"), step=Decimal("0.15"),
-            start_ts=datetime(2026, 4, 23, 8, 0, tzinfo=UTC),
-            tf_minutes=15,
-        )
-        out[(sym, 60)] = _synth_trend(
-            sym, 250, start_price=Decimal("100"), step=Decimal("0.30"),
-            start_ts=datetime(2026, 4, 15, 13, 35, tzinfo=UTC),
-            tf_minutes=60,
-        )
+    for tf_min in (5, 15, 60):
+        last_ts = NOW - timedelta(minutes=tf_min)
+        out[("AAPL", tf_min)] = _uptrend("AAPL", last_ts, _N_BARS[tf_min], tf_min)
+        out[("MSFT", tf_min)] = _flat("MSFT", last_ts, _N_BARS[tf_min], tf_min)
     return out
 
 
 def _canonical_bars_stale() -> dict[tuple[str, int], list[Bar]]:
-    """Same trend as the clean-entry scenario but 5Min bars stop 20
-    minutes before NOW so the stale_bar risk gate fires."""
-    out = _canonical_bars_clean_entry()
+    """All-uptrend bars where 5Min stops 20 minutes before NOW.
+
+    Latest 5Min close_ts = NOW - 15min = 900s old; the gate threshold
+    is 5min + 30s grace = 330s. 900 > 330 → stale_bar deny.
+
+    BOTH symbols need uptrend bars (not just AAPL) so the signal
+    passes first and the risk gate is actually exercised — otherwise
+    MSFT would short-circuit on `no_breakout` (signal-side denial)
+    and never reach the stale check.
+    """
+    out: dict[tuple[str, int], list[Bar]] = {}
+    last_5m = NOW - timedelta(minutes=20)
     for sym in ("AAPL", "MSFT"):
-        # 5Min bars end 20 min before NOW → latest close_ts = NOW - 15min
-        # → 900s old vs 330s freshness threshold → deny.
-        out[(sym, 5)] = _synth_trend(
-            sym, 120, start_price=Decimal("180"), step=Decimal("0.10"),
-            start_ts=NOW - timedelta(minutes=5 * 120 + 20),
-            tf_minutes=5, force_breakout=True,
-        )
+        # 15Min / 1Hour bars stay fresh (latest close_ts == NOW); only
+        # 5Min is stale.
+        out[(sym, 5)]  = _uptrend(sym, last_5m,
+                                  _N_BARS[5], 5)
+        out[(sym, 15)] = _uptrend(sym, NOW - timedelta(minutes=15),
+                                  _N_BARS[15], 15)
+        out[(sym, 60)] = _uptrend(sym, NOW - timedelta(minutes=60),
+                                  _N_BARS[60], 60)
     return out
+
+
+def _latest_visible_close(bars: dict[tuple[str, int], list[Bar]],
+                          symbol: str, now: datetime) -> Decimal:
+    """Match SimulatedBroker's quote synthesis: prefer the smallest tf
+    whose latest bar has ``close_ts <= now``, return its close."""
+    available = sorted(tf for (s, tf) in bars if s == symbol)
+    for tf_min in available:
+        usable = [b for b in bars[(symbol, tf_min)]
+                  if b.ts <= now - timedelta(minutes=tf_min)]
+        if usable:
+            return usable[-1].close
+    raise AssertionError(f"no visible bar for {symbol} at {now}")
 
 
 def _seed_state(s: Strategy) -> None:
@@ -154,10 +246,17 @@ def _make_cfg(tmp_path: Path):
 def _run_via_fake(bars: dict[tuple[str, int], list[Bar]], tmp_path: Path) -> dict:
     cfg = _make_cfg(tmp_path)
     broker = FakeBroker()
+    # Override the FakeBroker default quote so spread semantics match
+    # SimulatedBroker's Phase-1 synthesis (bid==ask==latest-visible
+    # close, spread_bps==0). Without this, the FakeBroker would
+    # advertise a hardcoded 4-bps spread and the intent payload's
+    # `spread_bps` field would diverge between runs even though the
+    # downstream decision is identical.
     for sym in ("AAPL", "MSFT"):
+        mid = _latest_visible_close(bars, sym, NOW)
         broker.latest_quotes[sym] = Quote(
             symbol=sym, ts=NOW,
-            bid_price=Decimal("199.98"), ask_price=Decimal("200.02"),
+            bid_price=mid, ask_price=mid,
             bid_size=100, ask_size=100,
         )
     for (sym, tf_min), bs in bars.items():
@@ -184,7 +283,11 @@ def _run_via_fake(bars: dict[tuple[str, int], list[Bar]], tmp_path: Path) -> dic
 def _run_via_sim(bars: dict[tuple[str, int], list[Bar]], tmp_path: Path) -> dict:
     cfg = _make_cfg(tmp_path)
     bar_dfs = {(sym, tf): _bars_to_df(bs) for (sym, tf), bs in bars.items()}
-    broker = SimulatedBroker(bars=bar_dfs, starting_cash=Decimal("12500"), now=NOW)
+    # SimulatedBroker computes equity = cash + position_value. The
+    # FakeBroker default hardcodes equity=25000 (cash=12500). Strategy
+    # uses equity for sizing — to make both runs see the same equity
+    # at decision time, give the sim equivalent cash so equity matches.
+    broker = SimulatedBroker(bars=bar_dfs, starting_cash=Decimal("25000"), now=NOW)
     log = SimulatedTradeLog(clock=lambda: broker._require_now())
 
     state = StateStore(tmp_path / "sim_state.json", fsync=False)
