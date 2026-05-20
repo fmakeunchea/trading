@@ -239,6 +239,10 @@ def _encode_open_trade(t: OpenTrade) -> dict[str, Any]:
         "protective_child_client_order_id": t.protective_child_client_order_id,
         "protective_child_broker_id": t.protective_child_broker_id,
         "last_seen_broker_qty": t.last_seen_broker_qty,
+        # Trailing-stop bookkeeping (optional; serialised as str | None
+        # so pre-trailing state.json files decode back to None defaults).
+        "entry_atr": None if t.entry_atr is None else str(t.entry_atr),
+        "highest_seen_price": None if t.highest_seen_price is None else str(t.highest_seen_price),
     }
 
 
@@ -283,4 +287,12 @@ def _decode_open_trade(t: dict[str, Any]) -> OpenTrade:
         protective_child_client_order_id=t.get("protective_child_client_order_id"),
         protective_child_broker_id=t.get("protective_child_broker_id"),
         last_seen_broker_qty=int(t["last_seen_broker_qty"]),
+        # Backwards-compat: pre-trailing state.json has no entry_atr /
+        # highest_seen_price keys; .get(...) returns None and the trailing
+        # logic seeds them on first quote tick.
+        entry_atr=(Decimal(t["entry_atr"]) if t.get("entry_atr") is not None else None),
+        highest_seen_price=(
+            Decimal(t["highest_seen_price"])
+            if t.get("highest_seen_price") is not None else None
+        ),
     )

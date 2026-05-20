@@ -309,14 +309,20 @@ class OpenTrade:
     qty: int
     entry_price: Decimal
     entry_ts: datetime
-    stop_price: Decimal              # bot-managed primary stop
-    disaster_stop_price: Decimal     # broker-side OTO child stop
+    stop_price: Decimal              # bot-managed primary stop (mutable: trailing ratchets it up)
+    disaster_stop_price: Decimal     # broker-side OTO child stop (immutable)
     target_price: Decimal
     intent_id: str
     parent_client_order_id: str
     protective_child_client_order_id: str | None
     protective_child_broker_id: str | None
     last_seen_broker_qty: int
+    # Trailing-stop bookkeeping. Both default to None for backwards
+    # compatibility with state.json files written before the feature
+    # existed; the trailing logic treats None as "not yet seeded" and
+    # initialises on first quote.
+    entry_atr: Decimal | None = None         # ATR at entry — anchors trailing thresholds
+    highest_seen_price: Decimal | None = None  # high-water mark of mid since entry
 
 
 @dataclass(slots=True)

@@ -581,9 +581,69 @@ class Strategy:
             if is_stale(quote.ts, now, self.config.risk.stale_data_max_age_s):
                 continue
 
+            # Update trailing stop FIRST (may raise trade.stop_price) so the
+            # exit check below reads the latest value. No-op when the feature
+            # is disabled in config or when prerequisites (entry_atr) are
+            # missing — that branch matches pre-feature behaviour exactly.
+            self._update_trailing_stop(trade, quote)
+
             exit_reason = self._determine_exit(trade, quote, now)
             if exit_reason is not None:
                 self._flatten_one(sym, now, reason=exit_reason, report=report)
+
+    def _update_trailing_stop(self, trade: OpenTrade, quote: Quote) -> None:
+        """Ratchet ``trade.stop_price`` upward as the trade gains.
+
+        Two phases, gated by the existing config knobs:
+
+        1. **Breakeven move.** Once the mid has gained
+           ``trailing_breakeven_at_atr × entry_atr`` over ``entry_price``,
+           raise the stop to ``entry_price`` (free trade from here).
+        2. **Active trail.** Once the mid has gained
+           ``trailing_activation_at_atr × entry_atr``, update the
+           high-water mark and trail the stop at ``trailing_distance_atr
+           × entry_atr`` below the high. The stop only ever moves UP —
+           never down — so a single big drawdown after a trail-update
+           cannot widen the stop.
+
+        No-op when:
+        * ``cfg.strategy.trailing_stop_enabled`` is False (baseline behaviour);
+        * ``trade.entry_atr`` is None (pre-trailing OpenTrade or a recovered
+          trade reconstructed from history that lacked an ATR);
+        * ``trade.entry_atr`` is non-positive (defensive).
+
+        These no-op branches are intentional — when the feature is
+        disabled or unseeded, baseline tests' exit semantics must hold
+        unchanged.
+        """
+        sp = self.config.strategy
+        if not sp.trailing_stop_enabled:
+            return
+        if trade.entry_atr is None or trade.entry_atr <= 0:
+            return
+
+        mid = quote.mid()
+        # Update high-water mark unconditionally — cheap, lets the
+        # active-trail branch read it without a second comparison.
+        if trade.highest_seen_price is None or mid > trade.highest_seen_price:
+            trade.highest_seen_price = mid
+
+        favorable = mid - trade.entry_price
+        if favorable <= 0:
+            return
+
+        # Phase 1: breakeven move (idempotent once stop >= entry_price).
+        breakeven_threshold = sp.trailing_breakeven_at_atr * trade.entry_atr
+        if favorable >= breakeven_threshold and trade.stop_price < trade.entry_price:
+            trade.stop_price = trade.entry_price
+
+        # Phase 2: active trail — only after the activation threshold.
+        activation_threshold = sp.trailing_activation_at_atr * trade.entry_atr
+        if favorable >= activation_threshold:
+            high = trade.highest_seen_price  # set above; never None here
+            candidate = high - sp.trailing_distance_atr * trade.entry_atr
+            if candidate > trade.stop_price:
+                trade.stop_price = candidate
 
     def _determine_exit(
         self,
@@ -865,6 +925,7 @@ class Strategy:
             terminal=terminal,
             submitted_stop_child=submitted_stop_child,
             now=now,
+            entry_atr=intent.atr,
         )
 
     def _finalize_entry(
@@ -880,6 +941,7 @@ class Strategy:
         terminal: BrokerOrder,
         submitted_stop_child: BrokerOrder | None,
         now: datetime,
+        entry_atr: Decimal | None = None,
     ) -> None:
         """THE canonical entry writer. Appends the terminal RESULT and, on
         a non-zero fill, reconstructs open_trades. Used by both the normal
@@ -923,6 +985,8 @@ class Strategy:
             protective_child_client_order_id=child_coid,
             protective_child_broker_id=child_bid,
             last_seen_broker_qty=filled_qty,
+            entry_atr=entry_atr,
+            highest_seen_price=avg_price,  # seed at entry so trailing has a HW immediately
         )
 
     # ---- submitted-but-unconfirmed recovery --------------------------

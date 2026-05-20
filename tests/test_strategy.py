@@ -684,6 +684,134 @@ def test_session_end_flattens_positions(cfg_and_paths, broker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trailing stop (opt-in via config; defaults preserve baseline behaviour)
+# ---------------------------------------------------------------------------
+
+def _enable_trailing(s: Strategy, *,
+                     breakeven_at_atr: str = "0.5",
+                     activation_at_atr: str = "1.5",
+                     distance_atr: str = "0.5") -> None:
+    """Swap the Strategy's config for one with trailing enabled.
+
+    StrategyConfig is frozen — use ``dataclasses.replace`` to build a
+    new Config, then point ``s.config`` at it.
+    """
+    import dataclasses
+    sp = dataclasses.replace(
+        s.config.strategy,
+        trailing_stop_enabled=True,
+        trailing_breakeven_at_atr=Decimal(breakeven_at_atr),
+        trailing_activation_at_atr=Decimal(activation_at_atr),
+        trailing_distance_atr=Decimal(distance_atr),
+    )
+    s.config = dataclasses.replace(s.config, strategy=sp)
+
+
+def _quote(price: str, ts: datetime = NOW) -> Quote:
+    p = Decimal(price)
+    return Quote(symbol="AAPL", ts=ts, bid_price=p, ask_price=p,
+                 bid_size=100, ask_size=100)
+
+
+def _seed_open_trade(s: Strategy, *,
+                     entry_price: str = "200.00",
+                     stop_price: str = "198.00",
+                     entry_atr: str | None = "2.00") -> OpenTrade:
+    t = OpenTrade(
+        symbol="AAPL", qty=10,
+        entry_price=Decimal(entry_price),
+        entry_ts=NOW - timedelta(minutes=15),
+        stop_price=Decimal(stop_price),
+        disaster_stop_price=Decimal("196.00"),
+        target_price=Decimal("204.00"),
+        intent_id="seed", parent_client_order_id=f"{COID_PREFIX}seed",
+        protective_child_client_order_id=f"{COID_PREFIX}child-AAPL",
+        protective_child_broker_id="b-stop-AAPL",
+        last_seen_broker_qty=10,
+        entry_atr=Decimal(entry_atr) if entry_atr is not None else None,
+        highest_seen_price=Decimal(entry_price),
+    )
+    s.state.open_trades["AAPL"] = t
+    return t
+
+
+def test_trailing_disabled_by_default_stop_never_moves(cfg_and_paths, broker) -> None:
+    """Baseline behaviour: trailing is opt-in. Even with an entry_atr
+    present and a strongly favorable quote, the stop must not move when
+    ``trailing_stop_enabled`` is False (the fixture default)."""
+    s = _strategy(cfg_and_paths, broker)
+    assert s.config.strategy.trailing_stop_enabled is False  # invariant
+    t = _seed_open_trade(s)
+    original_stop = t.stop_price
+    # Quote 5 ATR favorable — well past every threshold.
+    s._update_trailing_stop(t, _quote("210.00"))
+    assert t.stop_price == original_stop, "trailing must be a no-op when disabled"
+
+
+def test_trailing_disabled_when_entry_atr_missing(cfg_and_paths, broker) -> None:
+    """A recovered OpenTrade rebuilt from history has no ``entry_atr``.
+    Trailing must remain a no-op for those trades — they keep the fixed
+    stop they were recovered with. Safe default."""
+    s = _strategy(cfg_and_paths, broker)
+    _enable_trailing(s)
+    t = _seed_open_trade(s, entry_atr=None)
+    original_stop = t.stop_price
+    s._update_trailing_stop(t, _quote("210.00"))
+    assert t.stop_price == original_stop
+
+
+def test_trailing_enabled_breakeven_move_then_ratchet(cfg_and_paths, broker) -> None:
+    """Enabled + favorable progression. Walk a position through:
+    (a) small favorable move — no change yet,
+    (b) crosses breakeven threshold — stop moves to entry,
+    (c) crosses activation — trail kicks in,
+    (d) further favorable — ratchets up,
+    (e) pullback — stop does NOT move down.
+    """
+    s = _strategy(cfg_and_paths, broker)
+    # entry=200, atr=2 → BE at +1 (200→201 quote), trail-activate at +3 (203),
+    # trail-distance 1 (so trailing stop sits $1 below high water).
+    _enable_trailing(s)
+    t = _seed_open_trade(s)
+
+    # (a) Small favorable — under breakeven threshold.
+    s._update_trailing_stop(t, _quote("200.50"))
+    assert t.stop_price == Decimal("198.00"), "below breakeven threshold; no move"
+    assert t.highest_seen_price == Decimal("200.50")
+
+    # (b) Cross breakeven (favorable == 1.0 = 0.5 ATR).
+    s._update_trailing_stop(t, _quote("201.00"))
+    assert t.stop_price == Decimal("200.00"), "moved to entry (breakeven)"
+
+    # (c) Cross trail activation (favorable == 3.5 > 1.5 ATR).
+    s._update_trailing_stop(t, _quote("203.50"))
+    # candidate = high (203.50) - distance (1.0) = 202.50
+    assert t.stop_price == Decimal("202.50"), "trailed to high - 0.5*ATR"
+    assert t.highest_seen_price == Decimal("203.50")
+
+    # (d) Further favorable — high climbs, trail follows.
+    s._update_trailing_stop(t, _quote("205.00"))
+    assert t.highest_seen_price == Decimal("205.00")
+    assert t.stop_price == Decimal("204.00"), "trail ratchets to 205 - 1"
+
+    # (e) Pullback — high stays, stop stays (NEVER moves down).
+    s._update_trailing_stop(t, _quote("204.20"))
+    assert t.highest_seen_price == Decimal("205.00"), "high water unchanged"
+    assert t.stop_price == Decimal("204.00"), "ratchet-only — must not move down"
+
+
+def test_trailing_enabled_adverse_move_does_not_widen_stop(cfg_and_paths, broker) -> None:
+    """Immediate adverse move: favorable <= 0 → early return. Stop
+    unchanged; high-water mark not bumped past entry."""
+    s = _strategy(cfg_and_paths, broker)
+    _enable_trailing(s)
+    t = _seed_open_trade(s)
+    original_stop = t.stop_price
+    s._update_trailing_stop(t, _quote("199.00"))
+    assert t.stop_price == original_stop
+
+
+# ---------------------------------------------------------------------------
 # Restart recovery: broker has a position we don't have in state
 # ---------------------------------------------------------------------------
 

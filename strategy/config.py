@@ -169,6 +169,17 @@ class StrategyConfig:
     reentry_cooldown_bars: int
     max_hold_bars: int            # bot-side time-stop on entry TF
     tick_interval_s: float        # orchestrator sleep between ticks
+    # --- trailing stop (opt-in, defaults preserve baseline behaviour) ----
+    # When enabled, the bot-side stop ratchets up as the trade moves
+    # favorably. Two-phase: (1) move stop to entry (breakeven) after the
+    # trade has gained `trailing_breakeven_at_atr × ATR`; (2) once the
+    # trade has gained `trailing_activation_at_atr × ATR`, start trailing
+    # the stop at `trailing_distance_atr × ATR` below the highest mid
+    # seen since entry. Ratchet-only — the stop never moves down.
+    trailing_stop_enabled: bool = False
+    trailing_breakeven_at_atr: Decimal = Decimal("0.5")
+    trailing_activation_at_atr: Decimal = Decimal("1.5")
+    trailing_distance_atr: Decimal = Decimal("0.5")
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +356,10 @@ def _load_strategy(d: Mapping[str, Any]) -> StrategyConfig:
         reentry_cooldown_bars=int(d.get("reentry_cooldown_bars", 6)),
         max_hold_bars=int(d.get("max_hold_bars", 24)),
         tick_interval_s=float(d.get("tick_interval_s", 10.0)),
+        trailing_stop_enabled=bool(d.get("trailing_stop_enabled", False)),
+        trailing_breakeven_at_atr=Decimal(str(d.get("trailing_breakeven_at_atr", "0.5"))),
+        trailing_activation_at_atr=Decimal(str(d.get("trailing_activation_at_atr", "1.5"))),
+        trailing_distance_atr=Decimal(str(d.get("trailing_distance_atr", "0.5"))),
     )
 
 
@@ -487,6 +502,16 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("reentry_cooldown_bars/max_hold_bars invariants violated")
     if sp.tick_interval_s <= 0:
         raise ConfigError("tick_interval_s must be positive")
+    if sp.trailing_stop_enabled:
+        if sp.trailing_breakeven_at_atr <= 0:
+            raise ConfigError("trailing_breakeven_at_atr must be positive when trailing enabled")
+        if sp.trailing_activation_at_atr <= sp.trailing_breakeven_at_atr:
+            raise ConfigError(
+                "trailing_activation_at_atr must be strictly greater than "
+                "trailing_breakeven_at_atr (breakeven before trail)"
+            )
+        if sp.trailing_distance_atr <= 0:
+            raise ConfigError("trailing_distance_atr must be positive when trailing enabled")
     if len(sp.symbols) > 50:
         raise ConfigError("symbols universe capped at 50 in v1")
 
