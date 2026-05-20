@@ -263,11 +263,12 @@ def test_parity_clean_entry(tmp_path) -> None:
     """Same trending bars + same Strategy → same entries/intents/state
     through FakeBroker and SimulatedBroker."""
     bars = _canonical_bars_clean_entry()
-    # Use disjoint tmp_paths so the two runs' state files don't collide.
-    fake = _run_via_fake(bars, tmp_path / "fake")
-    sim  = _run_via_sim(bars,  tmp_path / "sim")
+    # Disjoint tmp subdirs so the two runs' state/log files don't collide.
+    # MUST exist before _run_via_* (their _make_cfg writes cfg.yaml into them).
     (tmp_path / "fake").mkdir(parents=True, exist_ok=True)
     (tmp_path / "sim").mkdir(parents=True, exist_ok=True)
+    fake = _run_via_fake(bars, tmp_path / "fake")
+    sim  = _run_via_sim(bars,  tmp_path / "sim")
 
     # Behavior (the strongest claim).
     assert fake["entries"] == sim["entries"], (
@@ -318,6 +319,8 @@ def test_parity_stale_bar_deny(tmp_path) -> None:
     """Same stale bars → both brokers cause the risk gate to fire
     ``stale_bar`` on every symbol; no entries on either side."""
     bars = _canonical_bars_stale()
+    (tmp_path / "fake").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "sim").mkdir(parents=True, exist_ok=True)
     fake = _run_via_fake(bars, tmp_path / "fake")
     sim  = _run_via_sim(bars,  tmp_path / "sim")
 
