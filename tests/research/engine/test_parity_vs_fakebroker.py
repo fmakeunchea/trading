@@ -320,6 +320,16 @@ _NON_STRUCTURAL_RESULT_KEYS = {
     "intent_id", "client_order_id",
     "broker_order_id",
     "protective_child_client_order_id", "protective_child_broker_id",
+    # protective_child_status: FakeBroker emits OrderStatus.NEW; the
+    # SimulatedBroker emits OrderStatus.HELD. Both are valid Alpaca
+    # states for a just-submitted OTO stop child whose parent has just
+    # filled (real Alpaca transitions HELD → NEW as the parent finishes
+    # terminalizing). The Strategy treats both as "non-terminal
+    # protective child present" and acts identically — the difference
+    # is implementation-detail between two test doubles, not a parity
+    # break. Pinned in the integration test (1.3) as "non-None", which
+    # is the real behavioral invariant.
+    "protective_child_status",
     # status enum string casing already pinned by test_integration_one_entry
 }
 
